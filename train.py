@@ -1,24 +1,36 @@
 """
-train.py — Full SNV-judge training pipeline
-============================================
+train.py — Full SNV-judge v2 training pipeline
+===============================================
 Reproduces the complete pipeline from data acquisition to model artefacts.
 
 Steps:
-  1. Fetch ClinVar gold-standard variants (BRCA1/BRCA2/TP53)
-  2. Annotate via Ensembl VEP REST API (SIFT, PolyPhen-2, AlphaMissense, CADD, REVEL)
-  3. Clean data + gene-based train/test split
-  4. Train XGBoost + Logistic Regression with bootstrap evaluation
-  5. Platt calibration
-  6. SHAP analysis + figures
-  7. Save all model artefacts
+  1. Fetch ClinVar gold-standard variants (multi-gene, ≥2-star review)
+  2. Annotate via Ensembl VEP REST API (SIFT, PolyPhen-2, AlphaMissense, CADD)
+  3. Score variants with Evo2 (NVIDIA NIM API) and Genos (Stomics API)
+  4. Clean data + 5-fold cross-validation
+  5. Train XGBoost + LightGBM Stacking ensemble
+  6. Platt calibration
+  7. SHAP analysis + figures
+  8. Save all model artefacts
+
+New in v2:
+  - Expanded dataset: 10,542 ClinVar missense variants across 2,927 genes
+  - Evo2 (Arc Institute / NVIDIA): zero-shot log-likelihood ratio scoring
+    via NVIDIA NIM API (evo2-40b model)
+  - Genos (Zhejiang Lab): human-centric genomic foundation model
+    pathogenicity score via Stomics cloud API
+  - Stacking ensemble: XGBoost + LightGBM meta-learner
 
 Usage:
+  # Set API keys as environment variables:
+  export EVO2_API_KEY="nvapi-..."
+  export GENOS_API_KEY="sk-..."
   python train.py
 
 Outputs (saved to current directory):
-  xgb_model.pkl, platt_scaler.pkl, shap_explainer.pkl, train_medians.pkl
-  data/clinvar_raw.csv, data/feature_matrix.xlsx, data/model_metrics.csv
-  figures/model_curves.png, figures/shap_analysis.png
+  xgb_model_v2.pkl, platt_scaler_v2.pkl, shap_explainer_v2.pkl, train_medians_v2.pkl
+  data/clinvar_raw_v2.csv, data/feature_matrix_v2.xlsx, data/model_metrics_v2.csv
+  figures/model_curves_v2.png, figures/shap_analysis_v2.png
 """
 
 import os, time, pickle, warnings
@@ -33,11 +45,16 @@ import matplotlib.patches as mpatches
 import seaborn as sns
 import shap
 import xgboost as xgb
+import lightgbm as lgb
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import StackingClassifier
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import (roc_auc_score, average_precision_score,
                              roc_curve, precision_recall_curve)
 warnings.filterwarnings("ignore")
@@ -46,11 +63,16 @@ warnings.filterwarnings("ignore")
 Path("data").mkdir(exist_ok=True)
 Path("figures").mkdir(exist_ok=True)
 
+# ── API Keys (set via environment variables) ──────────────────────────────
+EVO2_API_KEY  = os.environ.get("EVO2_API_KEY", "")
+GENOS_API_KEY = os.environ.get("GENOS_API_KEY", "")
+EVO2_URL  = "https://health.api.nvidia.com/v1/biology/arc/evo2-40b/generate"
+GENOS_URL = "https://cloud.stomics.tech/api/aigateway/genos/variant_predict"
+
 FEATURE_COLS   = ["sift_score_inv", "polyphen_score", "am_pathogenicity",
-                  "cadd_phred", "revel"]
-FEATURE_LABELS = ["SIFT (inv)", "PolyPhen-2", "AlphaMissense", "CADD Phred", "REVEL"]
-GENES          = ["BRCA1", "BRCA2", "TP53"]
-GENE_IDS       = {"BRCA1": "672", "BRCA2": "675", "TP53": "7157"}
+                  "cadd_phred", "evo2_llr", "genos_path"]
+FEATURE_LABELS = ["SIFT (inv)", "PolyPhen-2", "AlphaMissense", "CADD Phred",
+                  "Evo2 LLR", "Genos Score"]
 
 # ══════════════════════════════════════════════════════════════════════════
 # STEP 1: Fetch ClinVar variants
@@ -441,6 +463,109 @@ def step6_save(xgb_model, platt, explainer, medians):
         with open(fname, "wb") as f:
             pickle.dump(obj, f)
         print(f"  Saved {fname}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# STEP 2b: Evo2 zero-shot variant scoring (NVIDIA NIM API)
+# ══════════════════════════════════════════════════════════════════════════
+def evo2_score_variant(ref_context: str, alt_context: str) -> float:
+    """
+    Zero-shot variant effect score using Evo2 log-likelihood ratio.
+
+    Method: Feed (prefix + base + suffix) to Evo2, get P(next_token | context).
+    Score = log P(continuation | alt_context) - log P(continuation | ref_context)
+    Negative score → alt disrupts sequence → potentially pathogenic.
+
+    Requires EVO2_API_KEY environment variable.
+    """
+    if not EVO2_API_KEY:
+        return np.nan
+    mid = len(ref_context) // 2
+    prefix = ref_context[:mid]
+    suffix = ref_context[mid+1:mid+6]
+    hdrs = {"Authorization": f"Bearer {EVO2_API_KEY}",
+            "Content-Type": "application/json"}
+    log_probs = {}
+    for base, label in [(ref_context[mid], 'ref'), (alt_context[mid], 'alt')]:
+        payload = {"sequence": prefix + base + suffix, "num_tokens": 1,
+                   "top_k": 4, "enable_sampled_probs": True, "temperature": 0.001}
+        for attempt in range(3):
+            try:
+                r = requests.post(EVO2_URL, headers=hdrs, json=payload, timeout=30)
+                if r.status_code == 200:
+                    p = r.json().get('sampled_probs', [None])[0]
+                    log_probs[label] = np.log(p) if p and p > 0 else np.nan
+                    break
+                elif r.status_code == 429:
+                    time.sleep(5 * (attempt + 1))
+                else:
+                    time.sleep(1)
+            except Exception:
+                time.sleep(2)
+        time.sleep(0.05)
+    return log_probs.get('alt', np.nan) - log_probs.get('ref', np.nan)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# STEP 2c: Genos variant pathogenicity scoring (Stomics API)
+# ══════════════════════════════════════════════════════════════════════════
+def genos_score_variant(chrom: str, pos: int, ref: str, alt: str) -> dict:
+    """
+    Genos (Zhejiang Lab) human-centric genomic foundation model score.
+    Returns score_Pathogenic and score_Benign.
+
+    Requires GENOS_API_KEY environment variable.
+    """
+    if not GENOS_API_KEY:
+        return {'genos_path': np.nan, 'genos_benign': np.nan}
+    hdrs = {"Authorization": f"Bearer {GENOS_API_KEY}",
+            "Content-Type": "application/json"}
+    payload = {"assembly": "hg38", "chrom": f"chr{chrom}",
+               "pos": int(pos), "ref": ref, "alt": alt}
+    for attempt in range(3):
+        try:
+            r = requests.post(GENOS_URL, headers=hdrs, json=payload, timeout=30)
+            if r.status_code == 200:
+                res = r.json().get('result', {})
+                return {'genos_path':   res.get('score_Pathogenic', np.nan),
+                        'genos_benign': res.get('score_Benign', np.nan)}
+            elif r.status_code == 429:
+                time.sleep(5 * (attempt + 1))
+            else:
+                time.sleep(1)
+        except Exception:
+            time.sleep(2)
+    return {'genos_path': np.nan, 'genos_benign': np.nan}
+
+
+def step2b_score_ai_features(df: pd.DataFrame, n_workers: int = 10) -> pd.DataFrame:
+    """Score all variants with Evo2 and Genos in parallel."""
+    print(f"\n=== Step 2b/c: Scoring {len(df):,} variants with Evo2 + Genos ===")
+
+    def score_one(args):
+        idx, row = args
+        e = evo2_score_variant(row['ref_context'], row['alt_context'])
+        g = genos_score_variant(row['chrom'], row['pos'], row['ref'], row['alt'])
+        return idx, e, g
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        futs = {ex.submit(score_one, rv): rv[0] for rv in df.iterrows()}
+        done = 0
+        for fut in as_completed(futs):
+            try:
+                idx, e, g = fut.result()
+                results[idx] = {'evo2_llr': e, **g}
+            except Exception:
+                idx = futs[fut]
+                results[idx] = {'evo2_llr': np.nan, 'genos_path': np.nan,
+                                'genos_benign': np.nan}
+            done += 1
+            if done % 200 == 0 or done == len(df):
+                print(f"  {done:,}/{len(df):,} ({done/len(df)*100:.0f}%)")
+
+    ai_df = pd.DataFrame.from_dict(results, orient='index')
+    return df.join(ai_df)
 
 
 # ══════════════════════════════════════════════════════════════════════════

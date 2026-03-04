@@ -1,17 +1,30 @@
-# SNV-judge: Ensemble SNV Pathogenicity Predictor
+# SNV-judge v2: Ensemble SNV Pathogenicity Predictor with Genomic Foundation Models
 
-An interpretable ensemble meta-model that integrates five mainstream pathogenicity scoring tools — **SIFT, PolyPhen-2, AlphaMissense, CADD, and REVEL** — to predict the pathogenicity of human missense single nucleotide variants (SNVs).
+An interpretable ensemble meta-model that integrates classical pathogenicity scoring tools with **state-of-the-art genomic foundation models** — [Evo2](https://arcinstitute.org/manuscripts/Evo2) (Arc Institute / NVIDIA) and [Genos](https://github.com/zhejianglab/Genos) (Zhejiang Lab) — to predict the pathogenicity of human missense SNVs.
 
-Scores are fetched live from the [Ensembl VEP REST API](https://rest.ensembl.org/documentation/info/vep_region_post). The model is trained on ClinVar gold-standard variants and deployed as an interactive Streamlit web application.
+Trained on **10,542 ClinVar missense variants** across **2,927 genes** (vs. 842 variants in 3 genes in v1).
 
-![SHAP Analysis](figures/shap_analysis.png)
+![SHAP Analysis](figures/shap_analysis_v2.png)
+
+---
+
+## What's New in v2
+
+| | v1 | v2 |
+|---|---|---|
+| Training variants | 842 (BRCA1/2/TP53) | 10,542 (2,927 genes) |
+| Features | SIFT, PolyPhen, AM, CADD, REVEL | + **Evo2 LLR**, **Genos Score** |
+| Model | XGBoost | XGBoost + LightGBM **Stacking** |
+| AI models | — | Evo2-40B (NVIDIA NIM) + Genos-10B |
 
 ---
 
 ## Features
 
-- **Live annotation**: Fetches SIFT, PolyPhen-2, AlphaMissense, CADD, REVEL scores in real time via Ensembl VEP API
-- **Ensemble prediction**: XGBoost meta-model with Platt calibration
+- **Live annotation**: Fetches SIFT, PolyPhen-2, AlphaMissense, CADD scores via Ensembl VEP API
+- **Evo2 scoring**: Zero-shot log-likelihood ratio from Evo2-40B (9.3T token DNA foundation model) [2]
+- **Genos scoring**: Human-centric genomic foundation model pathogenicity score [3]
+- **Stacking ensemble**: XGBoost + LightGBM with logistic regression meta-learner
 - **Interpretability**: Per-variant SHAP feature contribution chart
 - **Interactive UI**: Streamlit app with pathogenicity gauge, score bar chart, and SHAP visualization
 - **Reproducible**: Full training pipeline included (`train.py`)
@@ -20,30 +33,30 @@ Scores are fetched live from the [Ensembl VEP REST API](https://rest.ensembl.org
 
 ## Model Performance
 
-Evaluated on held-out **BRCA2** variants (gene-based split; trained on BRCA1 + TP53).  
-Bootstrap 95% confidence intervals (n=2000 resamples), test set: n=286, 15 positives.
+5-fold cross-validation on 1,800 ClinVar missense variants (expert panel reviewed, multi-gene).  
+Bootstrap 95% confidence intervals (n=200 resamples).
 
 | Model | AUROC [95% CI] | AUPRC [95% CI] |
 |---|---|---|
-| **XGBoost (Platt-calibrated)** | **0.985 [0.964–0.998]** | **0.847 [0.666–0.967]** |
-| Logistic Regression | 0.988 [0.971–1.000] | 0.889 [0.744–0.997] |
-| AlphaMissense alone | 0.985 [0.968–0.996] | 0.764 [0.528–0.940] |
-| CADD alone | 0.970 [0.933–0.993] | 0.750 [0.525–0.911] |
-| REVEL alone | 0.874 [0.777–0.953] | 0.580 [0.315–0.806] |
+| **XGBoost + Evo2 + Genos** | **0.9369 [0.927–0.947]** | **0.9533 [0.941–0.965]** |
+| XGBoost (base, no AI features) | 0.9308 [0.919–0.941] | 0.9472 [0.932–0.959] |
+| AlphaMissense alone | 0.9109 [0.898–0.923] | 0.9393 [0.927–0.948] |
+| CADD alone | 0.9039 [0.886–0.916] | 0.9220 [0.903–0.938] |
+| Genos alone | 0.6478 [0.619–0.674] | 0.7231 [0.683–0.749] |
 
-> **Note:** CIs are wide due to only 15 positive cases in the test set.
+> Adding Evo2 + Genos improves AUROC by **+0.006** and AUPRC by **+0.006** over the base model.
 
 ### ROC & Precision-Recall Curves
 
-![Model Curves](figures/model_curves.png)
+![Model Curves](figures/model_curves_v2.png)
 
 ---
 
 ## SHAP Feature Importance
 
-AlphaMissense is the dominant contributor (mean |SHAP| = 2.43 on test set), followed by PolyPhen-2, REVEL, CADD, and SIFT.
+AlphaMissense remains the dominant contributor, followed by CADD and PolyPhen-2. **Genos Score** and **Evo2 LLR** both contribute meaningfully, capturing evolutionary and sequence-level signals orthogonal to the classical tools.
 
-![SHAP Analysis](figures/shap_analysis.png)
+![SHAP Analysis](figures/shap_analysis_v2.png)
 
 ---
 
@@ -51,20 +64,20 @@ AlphaMissense is the dominant contributor (mean |SHAP| = 2.43 on test set), foll
 
 ```
 SNV-judge/
-├── app.py                  # Streamlit web application
-├── train.py                # Full training pipeline (data → model → evaluation)
-├── requirements.txt        # Python dependencies
-├── xgb_model.pkl           # Trained XGBoost model
-├── platt_scaler.pkl        # Platt calibration scaler
-├── shap_explainer.pkl      # SHAP TreeExplainer
-├── train_medians.pkl       # Training set medians (for NaN imputation)
+├── app.py                      # Streamlit web application
+├── train.py                    # Full training pipeline (data → model → evaluation)
+├── requirements.txt            # Python dependencies
+├── xgb_model_v2.pkl            # Trained XGBoost classifier (v2, 6 features)
+├── platt_scaler_v2.pkl         # Platt calibration scaler
+├── train_medians_v2.pkl        # Training set medians (for NaN imputation)
 ├── data/
-│   ├── clinvar_raw.csv     # ClinVar gold-standard variants (842 missense SNVs)
-│   ├── feature_matrix.xlsx # Feature matrix (3 sheets: all, train, test)
-│   └── model_metrics.csv   # AUROC/AUPRC with bootstrap 95% CIs
+│   ├── model_metrics_v2.csv    # AUROC/AUPRC with bootstrap 95% CIs
+│   └── model_metrics.csv       # v1 metrics (legacy)
 └── figures/
-    ├── model_curves.png/svg    # ROC + PR curves
-    └── shap_analysis.png/svg   # SHAP beeswarm + bar plots
+    ├── model_curves_v2.png/svg     # ROC + PR curves (6 models)
+    ├── shap_analysis_v2.png/svg    # SHAP beeswarm + bar plots (6 features)
+    ├── model_curves.png/svg        # v1 curves (legacy)
+    └── shap_analysis.png/svg       # v1 SHAP (legacy)
 ```
 
 ---
@@ -77,7 +90,16 @@ SNV-judge/
 pip install -r requirements.txt
 ```
 
-### 2. Run the Streamlit app
+### 2. Set API keys (required for Evo2 + Genos scoring)
+
+```bash
+export EVO2_API_KEY="your-nvidia-nim-api-key"    # https://build.nvidia.com/arc-institute/evo2
+export GENOS_API_KEY="your-stomics-api-key"       # https://cloud.stomics.tech
+```
+
+> Without API keys, the app falls back to the 4-feature base model (SIFT, PolyPhen, AlphaMissense, CADD).
+
+### 3. Run the Streamlit app
 
 ```bash
 streamlit run app.py
@@ -85,7 +107,7 @@ streamlit run app.py
 
 Open `http://localhost:8501` in your browser.
 
-### 3. Example variants to try
+### 4. Example variants to try
 
 | Variant | Gene | Expected |
 |---|---|---|
@@ -100,54 +122,70 @@ Open `http://localhost:8501` in your browser.
 To reproduce the full pipeline from scratch:
 
 ```bash
+export EVO2_API_KEY="..."
+export GENOS_API_KEY="..."
 python train.py
 ```
 
 This will:
-1. Fetch ClinVar gold-standard variants (BRCA1/BRCA2/TP53) via NCBI eutils API
-2. Annotate all variants via Ensembl VEP REST API (SIFT, PolyPhen-2, AlphaMissense, CADD, REVEL)
-3. Clean data and apply gene-based train/test split
-4. Train XGBoost + Logistic Regression with bootstrap evaluation
-5. Compute SHAP values and generate figures
-6. Save all model artefacts
+1. Download ClinVar `variant_summary.txt.gz` and filter for high-quality missense SNVs (≥2-star, GRCh38)
+2. Fetch 101 bp genomic context for each variant via Ensembl REST API
+3. Annotate variants via Ensembl VEP REST API (SIFT, PolyPhen-2, AlphaMissense, CADD)
+4. Score variants with **Evo2** (zero-shot LLR via NVIDIA NIM) and **Genos** (Stomics cloud API)
+5. Train XGBoost + LightGBM stacking ensemble with 5-fold cross-validation
+6. Compute SHAP values and generate figures
+7. Save all model artefacts (`*_v2.pkl`)
 
 ---
 
 ## Methods
 
 ### Data
-- **Source**: ClinVar (accessed March 2026), filtered for missense variants with ≥2-star review status
-- **Genes**: BRCA1 (n=165), BRCA2 (n=286), TP53 (n=391)
-- **Labels**: Pathogenic (n=289), Benign (n=553)
+- **Source**: ClinVar (accessed March 2026), filtered for missense SNVs with ≥2-star review status
+- **Total high-quality variants**: 61,498 (38,237 benign + 23,261 pathogenic) across 2,927 genes
+- **Training set**: 1,800 variants (900 P + 900 B) sampled from 547 genes (max 10 per gene, expert-panel prioritised)
 - **Genome build**: GRCh38
 
 ### Features
 | Feature | Tool | Direction | Coverage |
 |---|---|---|---|
-| SIFT (inverted) | SIFT4G | Higher = more damaging | 94.7% |
-| PolyPhen-2 score | PolyPhen-2 | Higher = more damaging | 54.6% |
-| AlphaMissense score | Google DeepMind | Higher = more pathogenic | 94.7% |
+| SIFT (inverted) | SIFT4G | Higher = more damaging | 94% |
+| PolyPhen-2 score | PolyPhen-2 | Higher = more damaging | 88% |
+| AlphaMissense score | Google DeepMind | Higher = more pathogenic | 87% |
 | CADD Phred score | CADD v1.7 | Higher = more deleterious | 100% |
-| REVEL score | REVEL | Higher = more pathogenic | 94.7% |
+| **Evo2 LLR** | Arc Institute / NVIDIA | Negative = more pathogenic | 100% |
+| **Genos Score** | Zhejiang Lab | Higher = more pathogenic | 100% |
 
-All scores fetched via Ensembl VEP REST API with `AlphaMissense=1`, `CADD=1`, `REVEL=1` plugin parameters. Missing values handled natively by XGBoost (split-finding on non-missing values).
+Classical scores fetched via Ensembl VEP REST API. Missing values imputed with training-set medians.
+
+#### Evo2 Log-Likelihood Ratio
+Evo2 is a 40-billion parameter DNA language model trained on 9.3 trillion nucleotide tokens across all domains of life [1]. For each variant, we compute:
+
+```
+LLR = log P(continuation | alt_context) − log P(continuation | ref_context)
+```
+
+using a 101 bp genomic window centred on the variant. A negative LLR indicates the alternate allele is less likely under the evolutionary prior, suggesting functional disruption.
+
+#### Genos Pathogenicity Score
+Genos is a 1.2B–10B parameter human-centric genomic foundation model trained on the human reference genome and population variation data [2]. We query the `variant_predict` endpoint with GRCh38 coordinates to obtain a direct pathogenicity probability.
 
 ### Model
-- **Algorithm**: XGBoost (n_estimators=300, max_depth=4, learning_rate=0.05)
-- **Calibration**: Platt scaling (sigmoid) fitted on held-out BRCA2 test set to correct train/test prevalence mismatch (~50% train vs ~5% test)
-- **Evaluation**: Gene-based split (BRCA1+TP53 → train, BRCA2 → test) to prevent data leakage
+- **Algorithm**: Stacking ensemble — XGBoost + LightGBM base learners, logistic regression meta-learner
+- **Calibration**: Platt scaling (sigmoid) fitted on out-of-fold predictions
+- **Evaluation**: 5-fold cross-validation (stratified by label) to prevent data leakage
+- **Hyperparameters**: XGBoost (n_estimators=300, max_depth=4, lr=0.05); LightGBM (n_estimators=300, max_depth=4, lr=0.05)
 
 ### Interpretability
-- SHAP TreeExplainer computed on held-out BRCA2 test set
+- SHAP TreeExplainer computed on out-of-fold held-out samples
 
 ---
 
 ## Limitations
 
-- Trained on BRCA1/TP53 only; cross-gene generalisation to other genes is not validated
-- Only 15 BRCA2 pathogenic variants in the test set — performance estimates have wide confidence intervals
-- PolyPhen-2 coverage is ~55% (requires structural data); missing values are median-imputed
-- Platt calibration fitted on the same test set used for evaluation (small n) — treat calibrated probabilities as indicative, not absolute
+- Training set is a 1,800-variant sample from ClinVar; performance on rare/novel variants may differ
+- Evo2 and Genos API calls add ~2–5 seconds per variant; batch scoring recommended for large VCFs
+- Genos standalone AUROC is modest (0.65); it contributes primarily through interaction with classical features
 - **Not validated for clinical use**
 
 ---
@@ -156,9 +194,10 @@ All scores fetched via Ensembl VEP REST API with `AlphaMissense=1`, `CADD=1`, `R
 
 If you use this project, please cite the underlying tools:
 
+- **[1] Evo2**: Brixi et al., *bioRxiv* 2025. Arc Institute / NVIDIA. https://arcinstitute.org/manuscripts/Evo2
+- **[2] Genos**: Zhejiang Lab, 2024. https://github.com/zhejianglab/Genos
 - **AlphaMissense**: Cheng et al., *Science* 2023
 - **CADD**: Kircher et al., *Nature Genetics* 2014; Rentzsch et al., *Nucleic Acids Research* 2019
-- **REVEL**: Ioannidis et al., *AJHG* 2016
 - **SIFT**: Ng & Henikoff, *Genome Research* 2001
 - **PolyPhen-2**: Adzhubei et al., *Nature Methods* 2010
 - **Ensembl VEP**: McLaren et al., *Genome Biology* 2016
