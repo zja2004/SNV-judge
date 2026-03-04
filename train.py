@@ -243,31 +243,51 @@ def step2_fetch_vep(df_raw: pd.DataFrame) -> pd.DataFrame:
 # ══════════════════════════════════════════════════════════════════════════
 # STEP 3: Clean + split
 # ══════════════════════════════════════════════════════════════════════════
-def step3_clean_split(df_raw: pd.DataFrame, df_scores: pd.DataFrame):
-    print("\n=== Step 3: Cleaning + splitting ===")
-    df = df_raw.merge(df_scores[["variation_id"] + ["sift_score","polyphen_score",
-                                  "am_pathogenicity","cadd_phred","revel"]],
+def step3_clean_v2(df_raw: pd.DataFrame, df_scores: pd.DataFrame,
+                   df_ai: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge VEP scores + AI scores, compute derived features, drop rows with
+    all classical scores missing.  Returns a single DataFrame ready for CV.
+    """
+    print("\n=== Step 3: Cleaning + merging features ===")
+
+    # Merge VEP scores
+    vep_cols = ["variation_id", "sift_score", "polyphen_score",
+                "am_pathogenicity", "cadd_phred"]
+    df = df_raw.merge(df_scores[vep_cols], on="variation_id", how="left")
+
+    # Merge AI scores
+    if df_ai is not None and len(df_ai):
+        df = df.merge(df_ai[["variation_id", "evo2_llr", "genos_path"]],
                       on="variation_id", how="left")
-    df = df[~df[FEATURE_COLS[:-1]].isnull().all(axis=1)].copy()
+    else:
+        df["evo2_llr"]   = np.nan
+        df["genos_path"] = np.nan
+
+    # Derived features
     df["sift_score_inv"] = 1.0 - df["sift_score"]
-    df["label_bin"] = (df["label"] == "pathogenic").astype(int)
+    df["label_bin"]      = (df["label"] == "pathogenic").astype(int)
 
-    df_train = df[df["gene"].isin(["BRCA1","TP53"])].copy()
-    df_test  = df[df["gene"] == "BRCA2"].copy()
-    print(f"  Train: {len(df_train)} ({df_train['label_bin'].mean()*100:.1f}% pathogenic)")
-    print(f"  Test:  {len(df_test)}  ({df_test['label_bin'].mean()*100:.1f}% pathogenic)")
+    # Drop rows where ALL classical scores are missing
+    classical = ["sift_score_inv", "polyphen_score", "am_pathogenicity", "cadd_phred"]
+    df = df[~df[classical].isnull().all(axis=1)].copy()
 
-    with pd.ExcelWriter("data/feature_matrix.xlsx", engine="openpyxl") as w:
-        df.to_excel(w, sheet_name="All_Variants", index=False)
-        df_train.to_excel(w, sheet_name="Train_BRCA1_TP53", index=False)
-        df_test.to_excel(w, sheet_name="Test_BRCA2", index=False)
-    return df, df_train, df_test
+    print(f"  Dataset: {len(df):,} variants "
+          f"({df['label_bin'].mean()*100:.1f}% pathogenic, "
+          f"{df['gene'].nunique()} genes)")
+    print(f"  Feature coverage:")
+    for col in FEATURE_COLS:
+        n = df[col].notna().sum()
+        print(f"    {col:20s}: {n:,}/{len(df):,} ({100*n/len(df):.1f}%)")
+
+    df.to_csv("data/clinvar_v2_features.csv", index=False)
+    return df
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# STEP 4: Train models + evaluate
+# STEP 4: Train v2 model with 5-fold CV + Stacking ensemble
 # ══════════════════════════════════════════════════════════════════════════
-def bootstrap_metrics(y_true, y_prob, n_boot=2000, seed=42):
+def bootstrap_metrics(y_true, y_prob, n_boot=200, seed=42):
     rng = np.random.default_rng(seed)
     aurocs, auprcs = [], []
     n = len(y_true)
@@ -281,100 +301,138 @@ def bootstrap_metrics(y_true, y_prob, n_boot=2000, seed=42):
     return (np.percentile(aurocs, [2.5, 97.5]),
             np.percentile(auprcs, [2.5, 97.5]))
 
-def step4_train(df_train, df_test):
-    print("\n=== Step 4: Training models ===")
-    X_tr = df_train[FEATURE_COLS].values
-    y_tr = df_train["label_bin"].values
-    X_te = df_test[FEATURE_COLS].values
-    y_te = df_test["label_bin"].values
 
-    spw = (y_tr == 0).sum() / max((y_tr == 1).sum(), 1)
-
-    # XGBoost
-    xgb_model = xgb.XGBClassifier(
+def _make_stacking_model(spw: float):
+    """Build XGBoost + LightGBM stacking classifier."""
+    xgb_clf = xgb.XGBClassifier(
         n_estimators=300, max_depth=4, learning_rate=0.05,
         subsample=0.8, colsample_bytree=0.8,
         scale_pos_weight=spw, eval_metric="logloss",
-        random_state=42, n_jobs=-1)
-    xgb_model.fit(X_tr, y_tr, eval_set=[(X_te, y_te)], verbose=False)
-    xgb_proba = xgb_model.predict_proba(X_te)[:, 1]
+        random_state=42, n_jobs=-1, verbosity=0)
+    lgb_clf = lgb.LGBMClassifier(
+        n_estimators=300, max_depth=4, learning_rate=0.05,
+        subsample=0.8, colsample_bytree=0.8,
+        scale_pos_weight=spw,
+        random_state=42, n_jobs=-1, verbose=-1)
+    meta = LogisticRegression(max_iter=1000, C=1.0, random_state=42)
+    return StackingClassifier(
+        estimators=[("xgb", xgb_clf), ("lgb", lgb_clf)],
+        final_estimator=meta,
+        cv=3,
+        passthrough=False,
+        n_jobs=1,
+    )
 
-    # Platt calibration
-    logit = np.log(xgb_proba / (1 - xgb_proba + 1e-9))
+
+def step4_train_v2(df: pd.DataFrame):
+    """
+    5-fold stratified CV on the full dataset.
+    Returns: (final_model, platt_scaler, medians, oof_probs, y_all, metrics_df)
+    """
+    print("\n=== Step 4: Training v2 Stacking model (5-fold CV) ===")
+
+    # Impute missing values with column medians
+    X_raw = df[FEATURE_COLS].values.astype(float)
+    y     = df["label_bin"].values
+
+    medians = {col: float(np.nanmedian(X_raw[:, i]))
+               for i, col in enumerate(FEATURE_COLS)}
+    for i, col in enumerate(FEATURE_COLS):
+        mask = np.isnan(X_raw[:, i])
+        X_raw[mask, i] = medians[col]
+
+    spw = (y == 0).sum() / max((y == 1).sum(), 1)
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+    oof_probs = np.zeros(len(y))
+    fold_aurocs, fold_auprcs = [], []
+
+    for fold, (tr_idx, va_idx) in enumerate(skf.split(X_raw, y)):
+        X_tr, X_va = X_raw[tr_idx], X_raw[va_idx]
+        y_tr, y_va = y[tr_idx],     y[va_idx]
+
+        model = _make_stacking_model(spw)
+        model.fit(X_tr, y_tr)
+        proba = model.predict_proba(X_va)[:, 1]
+        oof_probs[va_idx] = proba
+
+        auroc = roc_auc_score(y_va, proba)
+        auprc = average_precision_score(y_va, proba)
+        fold_aurocs.append(auroc)
+        fold_auprcs.append(auprc)
+        print(f"  Fold {fold+1}: AUROC={auroc:.4f}  AUPRC={auprc:.4f}")
+
+    print(f"\n  CV mean AUROC = {np.mean(fold_aurocs):.4f} ± {np.std(fold_aurocs):.4f}")
+    print(f"  CV mean AUPRC = {np.mean(fold_auprcs):.4f} ± {np.std(fold_auprcs):.4f}")
+
+    # Platt calibration on OOF predictions
+    logit_oof = np.log(oof_probs / (1 - oof_probs + 1e-9))
     platt = LogisticRegression(max_iter=1000)
-    platt.fit(logit.reshape(-1, 1), y_te)
-    xgb_cal = platt.predict_proba(logit.reshape(-1, 1))[:, 1]
+    platt.fit(logit_oof.reshape(-1, 1), y)
+    cal_probs = platt.predict_proba(logit_oof.reshape(-1, 1))[:, 1]
 
-    # Logistic Regression
-    imp = SimpleImputer(strategy="median")
-    X_tr_imp = imp.fit_transform(X_tr)
-    X_te_imp  = imp.transform(X_te)
-    lr = Pipeline([("sc", StandardScaler()),
-                   ("clf", LogisticRegression(max_iter=1000,
-                                              class_weight="balanced",
-                                              random_state=42))])
-    lr.fit(X_tr_imp, y_tr)
-    lr_proba = lr.predict_proba(X_te_imp)[:, 1]
+    # Single-tool baselines (OOF normalised)
+    single_probas = {}
+    for i, lbl in enumerate(FEATURE_LABELS):
+        sc = X_raw[:, i].copy()
+        mn, mx = sc.min(), sc.max()
+        single_probas[lbl] = np.clip((sc - mn) / (mx - mn + 1e-9), 0, 1)
 
-    # Single-tool baselines
-    def single_proba(i):
-        sc = X_te[:, i].copy()
-        mn, mx = np.nanmin(X_tr[:, i]), np.nanmax(X_tr[:, i])
-        med = np.nanmedian(X_tr[:, i])
-        sc[np.isnan(sc)] = med
-        return np.clip((sc - mn) / (mx - mn + 1e-9), 0, 1)
-
-    single_probas = {lbl: single_proba(i) for i, lbl in enumerate(FEATURE_LABELS)}
-
-    # Metrics with CIs
+    # Metrics table
     rows = []
-    for name, prob in [("XGBoost (calibrated)", xgb_cal),
-                       ("Logistic Regression",  lr_proba)] + list(single_probas.items()):
-        auroc = roc_auc_score(y_te, prob)
-        auprc = average_precision_score(y_te, prob)
-        ci_r, ci_p = bootstrap_metrics(y_te, prob)
+    for name, prob in ([("XGBoost+LGB Stacking (calibrated)", cal_probs),
+                        ("XGBoost+LGB Stacking (raw OOF)",    oof_probs)]
+                       + list(single_probas.items())):
+        auroc = roc_auc_score(y, prob)
+        auprc = average_precision_score(y, prob)
+        ci_r, ci_p = bootstrap_metrics(y, prob)
         rows.append({"Model": name,
                      "AUROC": f"{auroc:.4f} [{ci_r[0]:.3f}–{ci_r[1]:.3f}]",
                      "AUPRC": f"{auprc:.4f} [{ci_p[0]:.3f}–{ci_p[1]:.3f}]"})
     df_metrics = pd.DataFrame(rows)
-    df_metrics.to_csv("data/model_metrics.csv", index=False)
-    print(df_metrics.to_string(index=False))
+    df_metrics.to_csv("data/model_metrics_v2.csv", index=False)
+    print("\n" + df_metrics.to_string(index=False))
 
-    # Training medians
-    medians = {col: float(np.nanmedian(X_tr[:, i]))
-               for i, col in enumerate(FEATURE_COLS)}
+    # Retrain final model on full dataset
+    print("\n  Retraining final model on full dataset…")
+    final_model = _make_stacking_model(spw)
+    final_model.fit(X_raw, y)
 
-    return xgb_model, platt, lr, medians, xgb_cal, lr_proba, single_probas, X_te, y_te
+    return final_model, platt, medians, cal_probs, oof_probs, y, single_probas, X_raw, df_metrics
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# STEP 5: SHAP + figures
+# STEP 5: SHAP + figures (v2 — 6 features, OOF evaluation)
 # ══════════════════════════════════════════════════════════════════════════
-def step5_shap_figures(xgb_model, X_te, y_te, xgb_cal, lr_proba, single_probas):
+def step5_shap_figures_v2(final_model, X_all, y_all,
+                          cal_probs, oof_probs, single_probas):
+    """Generate SHAP beeswarm + ROC/PR curves using OOF predictions."""
     print("\n=== Step 5: SHAP + figures ===")
     sns.set_theme(style="ticks", font_scale=1.05)
 
-    # SHAP
-    explainer   = shap.TreeExplainer(xgb_model)
-    shap_values = explainer.shap_values(X_te)
+    # Use the XGBoost base estimator for SHAP (StackingClassifier wraps it)
+    xgb_base = final_model.named_estimators_["xgb"]
+    explainer   = shap.TreeExplainer(xgb_base)
+    shap_values = explainer.shap_values(X_all)
     mean_abs    = np.abs(shap_values).mean(axis=0)
     order_idx   = np.argsort(mean_abs)[::-1]
     feat_sorted = [FEATURE_LABELS[i] for i in order_idx]
     y_pos_map   = {f: r for r, f in enumerate(feat_sorted)}
 
-    # SHAP figure
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
+    # ── SHAP figure ───────────────────────────────────────────────────────
+    FEAT_COLORS = ["#0072B2", "#E69F00", "#009E73", "#CC79A7", "#56B4E9", "#D55E00"]
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+
     ax = axes[0]
     vals = mean_abs[order_idx]
-    cols = ["#0072B2","#009E73","#CC79A7","#E69F00","#999999"]
-    bars = ax.barh(feat_sorted[::-1], vals[::-1], color=cols[::-1], height=0.6)
+    bar_cols = [FEAT_COLORS[i] for i in order_idx[::-1]]
+    bars = ax.barh(feat_sorted[::-1], vals[::-1], color=bar_cols, height=0.6)
     for bar, v in zip(bars, vals[::-1]):
-        ax.text(v+0.01, bar.get_y()+bar.get_height()/2, f"{v:.3f}",
-                va="center", ha="left", fontsize=10)
+        ax.text(v + vals.max() * 0.02, bar.get_y() + bar.get_height() / 2,
+                f"{v:.3f}", va="center", ha="left", fontsize=10)
     ax.set_xlabel("Mean |SHAP value|", fontsize=11)
-    ax.set_title("Feature Importance\n(Mean |SHAP|, BRCA2 test set)",
-                 fontsize=12, fontweight="bold")
-    ax.set_xlim(0, vals.max()*1.28)
+    ax.set_title("Feature Importance (Mean |SHAP|)\n5-fold OOF", fontsize=12, fontweight="bold")
+    ax.set_xlim(0, vals.max() * 1.3)
     sns.despine(ax=ax)
 
     ax = axes[1]
@@ -383,83 +441,103 @@ def step5_shap_figures(xgb_model, X_te, y_te, xgb_cal, lr_proba, single_probas):
     for i in order_idx:
         feat = FEATURE_LABELS[i]
         sv   = shap_values[:, i]
-        fv   = X_te[:, i].copy()
-        fv_norm = np.clip((fv - np.nanmin(fv)) / (np.nanmax(fv) - np.nanmin(fv) + 1e-9), 0, 1)
-        fv_norm[np.isnan(fv)] = 0.5
+        fv   = X_all[:, i].copy()
+        fv_norm = np.clip((fv - fv.min()) / (fv.max() - fv.min() + 1e-9), 0, 1)
         jitter = rng_.uniform(-0.3, 0.3, size=len(sv))
-        ax.scatter(sv, y_pos_map[feat]+jitter, c=fv_norm, cmap=cmap,
-                   s=14, alpha=0.75, linewidths=0, vmin=0, vmax=1)
+        ax.scatter(sv, y_pos_map[feat] + jitter, c=fv_norm, cmap=cmap,
+                   s=12, alpha=0.6, linewidths=0, vmin=0, vmax=1)
     ax.axvline(0, color="black", lw=0.8, ls="--", alpha=0.5)
-    ax.set_yticks(range(len(feat_sorted))); ax.set_yticklabels(feat_sorted, fontsize=11)
+    ax.set_yticks(range(len(feat_sorted)))
+    ax.set_yticklabels(feat_sorted, fontsize=11)
     ax.set_xlabel("SHAP value", fontsize=10)
-    ax.set_title("SHAP Beeswarm (BRCA2 test set)", fontsize=12, fontweight="bold")
-    sm = plt.cm.ScalarMappable(cmap=cmap, norm=mcolors.Normalize(0,1))
+    ax.set_title("SHAP Beeswarm (5-fold OOF)", fontsize=12, fontweight="bold")
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=mcolors.Normalize(0, 1))
     sm.set_array([])
     cbar = fig.colorbar(sm, ax=ax, fraction=0.03, pad=0.02)
-    cbar.set_ticks([0,0.5,1]); cbar.set_ticklabels(["Low","Mid","High"])
+    cbar.set_ticks([0, 0.5, 1])
+    cbar.set_ticklabels(["Low", "Mid", "High"])
     sns.despine(ax=ax)
     fig.tight_layout(pad=2.0)
-    fig.savefig("figures/shap_analysis.png", dpi=150, bbox_inches="tight")
-    fig.savefig("figures/shap_analysis.svg", bbox_inches="tight")
+    fig.savefig("figures/shap_analysis_v2.png", dpi=150, bbox_inches="tight")
+    fig.savefig("figures/shap_analysis_v2.svg", bbox_inches="tight")
     plt.close()
+    print("  Saved figures/shap_analysis_v2.png")
 
-    # ROC/PR figure
-    COLORS = {"XGBoost (calibrated)":"#0072B2","Logistic Regression":"#E69F00",
-              "AlphaMissense":"#009E73","CADD Phred":"#CC79A7","REVEL":"#56B4E9",
-              "PolyPhen-2":"#D55E00","SIFT (inv)":"#999999"}
-    LWIDTHS = {k: 2.5 if k in ("XGBoost (calibrated)","Logistic Regression") else 1.6
-               for k in COLORS}
-    LSTYLES = {"XGBoost (calibrated)":"-","Logistic Regression":"--",
-               "AlphaMissense":"-","CADD Phred":"-.","REVEL":":",
-               "PolyPhen-2":"--","SIFT (inv)":(0,(3,1,1,1))}
-    all_p = {"XGBoost (calibrated)": xgb_cal, "Logistic Regression": lr_proba,
+    # ── ROC / PR curves ───────────────────────────────────────────────────
+    COLORS = {
+        "Stacking (calibrated)": "#0072B2",
+        "Stacking (raw OOF)":    "#56B4E9",
+        "AlphaMissense":         "#009E73",
+        "CADD Phred":            "#CC79A7",
+        "Evo2 LLR":              "#E69F00",
+        "Genos Score":           "#D55E00",
+        "PolyPhen-2":            "#999999",
+        "SIFT (inv)":            "#000000",
+    }
+    LWIDTHS = {k: 2.5 if "Stacking" in k else 1.5 for k in COLORS}
+    LSTYLES = {
+        "Stacking (calibrated)": "-",
+        "Stacking (raw OOF)":    "--",
+        "AlphaMissense":         "-",
+        "CADD Phred":            "-.",
+        "Evo2 LLR":              ":",
+        "Genos Score":           "--",
+        "PolyPhen-2":            (0, (3, 1, 1, 1)),
+        "SIFT (inv)":            (0, (5, 2)),
+    }
+    all_p = {"Stacking (calibrated)": cal_probs,
+             "Stacking (raw OOF)":    oof_probs,
              **single_probas}
     curves = {}
     for name, prob in all_p.items():
-        fpr, tpr, _ = roc_curve(y_te, prob)
-        prec, rec, _ = precision_recall_curve(y_te, prob)
-        curves[name] = {"fpr":fpr,"tpr":tpr,"prec":prec,"rec":rec,
-                        "auroc":roc_auc_score(y_te,prob),
-                        "auprc":average_precision_score(y_te,prob)}
+        if name not in COLORS:
+            continue
+        fpr, tpr, _ = roc_curve(y_all, prob)
+        prec, rec, _ = precision_recall_curve(y_all, prob)
+        curves[name] = {"fpr": fpr, "tpr": tpr, "prec": prec, "rec": rec,
+                        "auroc": roc_auc_score(y_all, prob),
+                        "auprc": average_precision_score(y_all, prob)}
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
     for ax, metric, xl, yl, title, lloc in [
-        (axes[0],"auroc","FPR","TPR","ROC Curves","lower right"),
-        (axes[1],"auprc","Recall","Precision","PR Curves","upper right")]:
-        if metric=="auprc":
-            ax.axhline(y_te.mean(),color="k",ls=":",lw=0.8,alpha=0.4,
-                       label=f"Random (P={y_te.mean():.3f})")
+        (axes[0], "auroc", "FPR",    "TPR",       "ROC Curves",  "lower right"),
+        (axes[1], "auprc", "Recall", "Precision", "PR Curves",   "upper right"),
+    ]:
+        if metric == "auprc":
+            ax.axhline(y_all.mean(), color="k", ls=":", lw=0.8, alpha=0.4,
+                       label=f"Random (P={y_all.mean():.3f})")
         else:
-            ax.plot([0,1],[0,1],"k:",lw=0.8,alpha=0.4)
-        for name in COLORS:
-            c = curves[name]; v = c[metric]
-            xd = c["fpr"] if metric=="auroc" else c["rec"]
-            yd = c["tpr"] if metric=="auroc" else c["prec"]
-            ax.plot(xd, yd, color=COLORS[name], lw=LWIDTHS[name],
-                    ls=LSTYLES[name],
+            ax.plot([0, 1], [0, 1], "k:", lw=0.8, alpha=0.4)
+        for name, c in curves.items():
+            v  = c[metric]
+            xd = c["fpr"] if metric == "auroc" else c["rec"]
+            yd = c["tpr"] if metric == "auroc" else c["prec"]
+            ax.plot(xd, yd, color=COLORS[name], lw=LWIDTHS[name], ls=LSTYLES[name],
                     label=f"{name} ({'AUROC' if metric=='auroc' else 'AUPRC'}={v:.3f})")
-        ax.set_xlabel(xl,fontsize=11); ax.set_ylabel(yl,fontsize=11)
-        ax.set_title(f"{title} — BRCA2 Test Set",fontsize=12,fontweight="bold")
-        ax.legend(fontsize=7.8,loc=lloc,framealpha=0.92)
-        ax.set_xlim(-0.02,1.02); ax.set_ylim(-0.02,1.05)
+        ax.set_xlabel(xl, fontsize=11)
+        ax.set_ylabel(yl, fontsize=11)
+        ax.set_title(f"{title} — 5-fold OOF", fontsize=12, fontweight="bold")
+        ax.legend(fontsize=7.5, loc=lloc, framealpha=0.92)
+        ax.set_xlim(-0.02, 1.02)
+        ax.set_ylim(-0.02, 1.05)
         sns.despine(ax=ax)
     fig.tight_layout(pad=2.0)
-    fig.savefig("figures/model_curves.png", dpi=150, bbox_inches="tight")
-    fig.savefig("figures/model_curves.svg", bbox_inches="tight")
+    fig.savefig("figures/model_curves_v2.png", dpi=150, bbox_inches="tight")
+    fig.savefig("figures/model_curves_v2.svg", bbox_inches="tight")
     plt.close()
-    print("  Figures saved to figures/")
+    print("  Saved figures/model_curves_v2.png")
     return explainer
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# STEP 6: Save artefacts
+# STEP 6: Save v2 artefacts
 # ══════════════════════════════════════════════════════════════════════════
-def step6_save(xgb_model, platt, explainer, medians):
-    print("\n=== Step 6: Saving model artefacts ===")
-    for obj, fname in [(xgb_model, "xgb_model.pkl"),
-                       (platt,     "platt_scaler.pkl"),
-                       (explainer, "shap_explainer.pkl"),
-                       (medians,   "train_medians.pkl")]:
+def step6_save_v2(final_model, platt, medians):
+    """Save model artefacts with _v2 suffix."""
+    print("\n=== Step 6: Saving v2 model artefacts ===")
+    for obj, fname in [(final_model, "xgb_model_v2.pkl"),
+                       (platt,       "platt_scaler_v2.pkl"),
+                       (medians,     "train_medians_v2.pkl")]:
         with open(fname, "wb") as f:
             pickle.dump(obj, f)
         print(f"  Saved {fname}")
@@ -569,25 +647,105 @@ def step2b_score_ai_features(df: pd.DataFrame, n_workers: int = 10) -> pd.DataFr
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# MAIN
+# MAIN — v2 end-to-end pipeline
 # ══════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    print("SNV-judge Training Pipeline")
-    print("=" * 50)
+    import hashlib, datetime
 
-    # Use cached ClinVar data if available
-    clinvar_path = Path("data/clinvar_raw.csv")
-    if clinvar_path.exists():
-        print(f"\nLoading cached ClinVar data from {clinvar_path}")
-        df_raw = pd.read_csv(clinvar_path)
+    print("SNV-judge v2 Training Pipeline")
+    print("=" * 60)
+    print(f"  EVO2_API_KEY  : {'set' if EVO2_API_KEY  else 'NOT SET — Evo2 scoring disabled'}")
+    print(f"  GENOS_API_KEY : {'set' if GENOS_API_KEY else 'NOT SET — Genos scoring disabled'}")
+    print()
+
+    # ── Step 1: ClinVar data ──────────────────────────────────────────────
+    # The v2 pipeline expects a pre-downloaded ClinVar parquet/CSV with
+    # columns: variation_id, gene, chrom, pos, ref, alt, label, ref_context, alt_context
+    # (produced by the data preparation notebook / download script).
+    # If the file exists, load it; otherwise fall back to NCBI eutils fetch.
+    CLINVAR_V2 = Path("data/clinvar_v2_sample.parquet")
+    CLINVAR_V2_CSV = Path("data/clinvar_v2_sample.csv")
+
+    if CLINVAR_V2.exists():
+        print(f"[Step 1] Loading pre-sampled ClinVar data from {CLINVAR_V2}")
+        df_raw = pd.read_parquet(CLINVAR_V2)
+    elif CLINVAR_V2_CSV.exists():
+        print(f"[Step 1] Loading pre-sampled ClinVar data from {CLINVAR_V2_CSV}")
+        df_raw = pd.read_csv(CLINVAR_V2_CSV)
     else:
+        print("[Step 1] No pre-sampled data found — fetching from NCBI eutils…")
+        print("  (For large-scale training, download variant_summary.txt.gz from ClinVar)")
         df_raw = step1_fetch_clinvar()
+        df_raw.to_csv("data/clinvar_raw_v2.csv", index=False)
 
-    df_scores = step2_fetch_vep(df_raw)
-    df_clean, df_train, df_test = step3_clean_split(df_raw, df_scores)
-    xgb_model, platt, lr, medians, xgb_cal, lr_proba, single_probas, X_te, y_te = \
-        step4_train(df_train, df_test)
-    explainer = step5_shap_figures(xgb_model, X_te, y_te, xgb_cal, lr_proba, single_probas)
-    step6_save(xgb_model, platt, explainer, medians)
+    # Record data provenance
+    prov = {
+        "date":     datetime.datetime.utcnow().isoformat(),
+        "n_total":  len(df_raw),
+        "n_path":   int((df_raw["label"] == "pathogenic").sum()),
+        "n_benign": int((df_raw["label"] == "benign").sum()),
+        "n_genes":  int(df_raw["gene"].nunique()),
+    }
+    print(f"  Loaded {prov['n_total']:,} variants "
+          f"({prov['n_path']:,} P / {prov['n_benign']:,} B) "
+          f"across {prov['n_genes']:,} genes")
 
-    print("\nDone! Run the app with:  streamlit run app.py")
+    # ── Step 2a: VEP annotation ───────────────────────────────────────────
+    VEP_CACHE = Path("data/vep_scores_v2.pkl")
+    if VEP_CACHE.exists():
+        print(f"\n[Step 2a] Loading cached VEP scores from {VEP_CACHE}")
+        with open(VEP_CACHE, "rb") as f:
+            df_vep = pickle.load(f)
+    else:
+        print("\n[Step 2a] Fetching VEP scores…")
+        df_vep = step2_fetch_vep(df_raw)
+        with open(VEP_CACHE, "wb") as f:
+            pickle.dump(df_vep, f)
+
+    # ── Step 2b/c: Evo2 + Genos scoring ──────────────────────────────────
+    AI_CACHE = Path("data/ai_scores_v2.pkl")
+    df_ai = None
+    if AI_CACHE.exists():
+        print(f"\n[Step 2b] Loading cached AI scores from {AI_CACHE}")
+        with open(AI_CACHE, "rb") as f:
+            df_ai = pickle.load(f)
+    elif EVO2_API_KEY or GENOS_API_KEY:
+        print("\n[Step 2b] Scoring variants with Evo2 + Genos…")
+        # Requires ref_context / alt_context columns in df_raw
+        if "ref_context" not in df_raw.columns:
+            print("  WARNING: ref_context column missing — skipping AI scoring.")
+            print("  Run the data preparation script to fetch genomic context sequences.")
+        else:
+            df_ai_scored = step2b_score_ai_features(df_raw)
+            df_ai = df_ai_scored[["variation_id", "evo2_llr", "genos_path"]].copy()
+            with open(AI_CACHE, "wb") as f:
+                pickle.dump(df_ai, f)
+    else:
+        print("\n[Step 2b] No API keys set — skipping Evo2/Genos scoring.")
+        print("  Set EVO2_API_KEY and GENOS_API_KEY to enable AI features.")
+
+    # ── Step 3: Clean + merge ─────────────────────────────────────────────
+    df_clean = step3_clean_v2(df_raw, df_vep, df_ai)
+
+    # ── Step 4: Train v2 model ────────────────────────────────────────────
+    (final_model, platt, medians,
+     cal_probs, oof_probs, y_all,
+     single_probas, X_all, df_metrics) = step4_train_v2(df_clean)
+
+    # ── Step 5: SHAP + figures ────────────────────────────────────────────
+    step5_shap_figures_v2(final_model, X_all, y_all,
+                          cal_probs, oof_probs, single_probas)
+
+    # ── Step 6: Save artefacts ────────────────────────────────────────────
+    step6_save_v2(final_model, platt, medians)
+
+    # Save provenance
+    import json
+    prov["model_metrics"] = df_metrics.to_dict(orient="records")
+    with open("data/training_provenance_v2.json", "w") as f:
+        json.dump(prov, f, indent=2)
+    print("\n  Saved data/training_provenance_v2.json")
+
+    print("\n" + "=" * 60)
+    print("Done! Run the app with:  streamlit run app.py")
+    print("=" * 60)

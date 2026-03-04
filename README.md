@@ -1,21 +1,22 @@
-# SNV-judge v2: Ensemble SNV Pathogenicity Predictor with Genomic Foundation Models
+# SNV-judge v3: Ensemble SNV Pathogenicity Predictor with Genomic Foundation Models
 
-An interpretable ensemble meta-model that integrates classical pathogenicity scoring tools with **state-of-the-art genomic foundation models** — [Evo2](https://arcinstitute.org/manuscripts/Evo2) (Arc Institute / NVIDIA) and [Genos](https://github.com/zhejianglab/Genos) (Zhejiang Lab) — to predict the pathogenicity of human missense SNVs.
+An interpretable ensemble meta-model that integrates classical pathogenicity scoring tools with **state-of-the-art genomic foundation models** — [Evo2](https://arcinstitute.org/manuscripts/Evo2) (Arc Institute / NVIDIA) and [Genos](https://github.com/zhejianglab/Genos) (Zhejiang Lab) — plus **phyloP evolutionary conservation** to predict the pathogenicity of human missense SNVs.
 
-Trained on **10,542 ClinVar missense variants** across **2,927 genes** (vs. 842 variants in 3 genes in v1).
+Trained on **2,000 ClinVar missense variants** across **547 genes** (balanced 1:1 P/B, expert-panel reviewed).
 
-![SHAP Analysis](figures/shap_analysis_v2.png)
+![SHAP Analysis](figures/shap_analysis_v3.png)
 
 ---
 
-## What's New in v2
+## What's New in v3
 
-| | v1 | v2 |
-|---|---|---|
-| Training variants | 842 (BRCA1/2/TP53) | 10,542 (2,927 genes) |
-| Features | SIFT, PolyPhen, AM, CADD, REVEL | + **Evo2 LLR**, **Genos Score** |
-| Model | XGBoost | XGBoost + LightGBM **Stacking** |
-| AI models | — | Evo2-40B (NVIDIA NIM) + Genos-10B |
+| | v1 | v2 | v3 |
+|---|---|---|---|
+| Training variants | 842 (BRCA1/2/TP53) | 1,800 (547 genes) | **2,000 (547 genes)** |
+| Features | SIFT, PolyPhen, AM, CADD | + Evo2 LLR, Genos Score | + **phyloP conservation** |
+| Model | XGBoost | XGBoost + LightGBM Stacking | XGBoost + LightGBM Stacking |
+| AUROC | ~0.91 | 0.9373 | **0.9386** |
+| Batch VCF | — | — | **Yes (up to 500 SNVs)** |
 
 ---
 
@@ -38,25 +39,25 @@ Bootstrap 95% confidence intervals (n=200 resamples).
 
 | Model | AUROC [95% CI] | AUPRC [95% CI] |
 |---|---|---|
-| **XGBoost + Evo2 + Genos** | **0.9369 [0.927–0.947]** | **0.9533 [0.941–0.965]** |
-| XGBoost (base, no AI features) | 0.9308 [0.919–0.941] | 0.9472 [0.932–0.959] |
+| **v3: XGBoost + Evo2 + Genos + phyloP** | **0.9386 [0.929–0.949]** | **0.9328 [0.918–0.945]** |
+| v2: XGBoost + Evo2 + Genos | 0.9373 [0.927–0.947] | 0.9345 [0.921–0.946] |
 | AlphaMissense alone | 0.9109 [0.898–0.923] | 0.9393 [0.927–0.948] |
 | CADD alone | 0.9039 [0.886–0.916] | 0.9220 [0.903–0.938] |
 | Genos alone | 0.6478 [0.619–0.674] | 0.7231 [0.683–0.749] |
 
-> Adding Evo2 + Genos improves AUROC by **+0.006** and AUPRC by **+0.006** over the base model.
+> Adding phyloP conservation to v2 improves AUROC by **+0.0013** (pathogenic variants: mean phyloP = 1.82 vs. 0.12 for benign).
 
 ### ROC & Precision-Recall Curves
 
-![Model Curves](figures/model_curves_v2.png)
+![Model Curves](figures/model_curves_v3.png)
 
 ---
 
 ## SHAP Feature Importance
 
-AlphaMissense remains the dominant contributor, followed by CADD and PolyPhen-2. **Genos Score** and **Evo2 LLR** both contribute meaningfully, capturing evolutionary and sequence-level signals orthogonal to the classical tools.
+AlphaMissense remains the dominant contributor, followed by CADD and PolyPhen-2. **Genos Score**, **Evo2 LLR**, and **phyloP** all contribute meaningfully — phyloP captures evolutionary constraint orthogonal to the sequence-based tools.
 
-![SHAP Analysis](figures/shap_analysis_v2.png)
+![SHAP Analysis](figures/shap_analysis_v3.png)
 
 ---
 
@@ -64,20 +65,24 @@ AlphaMissense remains the dominant contributor, followed by CADD and PolyPhen-2.
 
 ```
 SNV-judge/
-├── app.py                      # Streamlit web application
+├── app.py                      # Streamlit web application (v3)
 ├── train.py                    # Full training pipeline (data → model → evaluation)
 ├── requirements.txt            # Python dependencies
-├── xgb_model_v2.pkl            # Trained XGBoost classifier (v2, 6 features)
-├── platt_scaler_v2.pkl         # Platt calibration scaler
-├── train_medians_v2.pkl        # Training set medians (for NaN imputation)
+├── xgb_model_v3.pkl            # Trained stacking classifier (v3, 7 features)
+├── platt_scaler_v3.pkl         # Platt calibration scaler (v3)
+├── train_medians_v3.pkl        # Training set medians (for NaN imputation, v3)
+├── feature_cols_v3.pkl         # Feature column names (v3)
+├── xgb_model_v2.pkl            # v2 model (6 features, kept for fallback)
+├── platt_scaler_v2.pkl         # v2 Platt scaler
+├── train_medians_v2.pkl        # v2 medians
 ├── data/
-│   ├── model_metrics_v2.csv    # AUROC/AUPRC with bootstrap 95% CIs
-│   └── model_metrics.csv       # v1 metrics (legacy)
+│   ├── model_metrics_v3.csv    # v3 AUROC/AUPRC with bootstrap 95% CIs
+│   └── model_metrics_v2.csv    # v2 metrics (legacy)
 └── figures/
-    ├── model_curves_v2.png/svg     # ROC + PR curves (6 models)
-    ├── shap_analysis_v2.png/svg    # SHAP beeswarm + bar plots (6 features)
-    ├── model_curves.png/svg        # v1 curves (legacy)
-    └── shap_analysis.png/svg       # v1 SHAP (legacy)
+    ├── model_curves_v3.png/svg     # ROC + PR curves (v3 vs v2)
+    ├── shap_analysis_v3.png/svg    # SHAP beeswarm + bar plots (7 features)
+    ├── model_curves_v2.png/svg     # v2 curves (legacy)
+    └── shap_analysis_v2.png/svg    # v2 SHAP (legacy)
 ```
 
 ---
@@ -143,7 +148,7 @@ This will:
 ### Data
 - **Source**: ClinVar (accessed March 2026), filtered for missense SNVs with ≥2-star review status
 - **Total high-quality variants**: 61,498 (38,237 benign + 23,261 pathogenic) across 2,927 genes
-- **Training set**: 1,800 variants (900 P + 900 B) sampled from 547 genes (max 10 per gene, expert-panel prioritised)
+- **Training set**: 2,000 variants (1,000 P + 1,000 B) sampled from 547 genes (max 10 per gene, expert-panel prioritised)
 - **Genome build**: GRCh38
 
 ### Features
@@ -155,8 +160,9 @@ This will:
 | CADD Phred score | CADD v1.7 | Higher = more deleterious | 100% |
 | **Evo2 LLR** | Arc Institute / NVIDIA | Negative = more pathogenic | 100% |
 | **Genos Score** | Zhejiang Lab | Higher = more pathogenic | 100% |
+| **phyloP score** | Ensembl VEP / UCSC | Higher = more conserved | 67% |
 
-Classical scores fetched via Ensembl VEP REST API. Missing values imputed with training-set medians.
+Classical scores and phyloP fetched via Ensembl VEP REST API (`Conservation=1`). Missing values imputed with training-set medians.
 
 #### Evo2 Log-Likelihood Ratio
 Evo2 is a 40-billion parameter DNA language model trained on 9.3 trillion nucleotide tokens across all domains of life [1]. For each variant, we compute:
@@ -183,9 +189,11 @@ Genos is a 1.2B–10B parameter human-centric genomic foundation model trained o
 
 ## Limitations
 
-- Training set is a 1,800-variant sample from ClinVar; performance on rare/novel variants may differ
+- Training set is a 2,000-variant sample from ClinVar; performance on rare/novel variants may differ
 - Evo2 and Genos API calls add ~2–5 seconds per variant; batch scoring recommended for large VCFs
 - Genos standalone AUROC is modest (0.65); it contributes primarily through interaction with classical features
+- phyloP coverage is 67% (VEP `conservation` field); missing values are imputed with training median
+- phyloP and CADD are partially correlated (both capture conservation); marginal gain from phyloP is modest (+0.0013 AUROC)
 - **Not validated for clinical use**
 
 ---
