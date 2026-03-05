@@ -8,15 +8,16 @@ Trained on **2,000 ClinVar missense variants** across **547 genes** (balanced 1:
 
 ---
 
-## What's New in v4
+## What's New in v4 + AI Report
 
-| | v1 | v2 | v3 | v4 |
-|---|---|---|---|---|
-| Training variants | 842 (BRCA1/2/TP53) | 1,800 (547 genes) | 2,000 (547 genes) | **2,000 (547 genes)** |
-| Features | SIFT, PolyPhen, AM, CADD | + Evo2 LLR, Genos Score | + phyloP conservation | + **gnomAD v4 AF** |
-| Model | XGBoost | XGBoost + LightGBM Stacking | XGBoost + LightGBM Stacking | XGBoost + LightGBM Stacking |
-| AUROC | ~0.91 | 0.9373 | 0.9488 | **0.9664** |
-| Batch VCF | — | — | Yes (up to 500 SNVs) | **Yes (up to 500 SNVs)** |
+| | v1 | v2 | v3 | v4 | **v4 + AI** |
+|---|---|---|---|---|---|
+| Training variants | 842 (BRCA1/2/TP53) | 1,800 (547 genes) | 2,000 (547 genes) | **2,000 (547 genes)** | **2,000 (547 genes)** |
+| Features | SIFT, PolyPhen, AM, CADD | + Evo2 LLR, Genos Score | + phyloP conservation | + **gnomAD v4 AF** | + **gnomAD v4 AF** |
+| Model | XGBoost | XGBoost + LightGBM Stacking | XGBoost + LightGBM Stacking | XGBoost + LightGBM Stacking | XGBoost + LightGBM Stacking |
+| AUROC | ~0.91 | 0.9373 | 0.9488 | **0.9664** | **0.9664** |
+| Batch VCF | — | — | Yes (up to 500 SNVs) | **Yes** | **Yes** |
+| AI Clinical Report | — | — | — | — | **✓ Kimi (moonshot-v1-32k)** |
 
 ---
 
@@ -28,7 +29,8 @@ Trained on **2,000 ClinVar missense variants** across **547 genes** (balanced 1:
 - **gnomAD AF**: Population allele frequency from gnomAD v4 (ACMG BA1/PM2 signal)
 - **Stacking ensemble**: XGBoost + LightGBM with logistic regression meta-learner
 - **Interpretability**: Per-variant SHAP feature contribution chart
-- **Interactive UI**: Streamlit app with pathogenicity gauge, score bar chart, and SHAP visualization
+- **🤖 AI Clinical Report** *(new)*: Kimi LLM (Moonshot AI) synthesizes all tool outputs into a structured ACMG-style clinical interpretation report with evidence-level annotations (PP3/BP4/PM2/BA1), streaming output, and Markdown download
+- **Interactive UI**: Streamlit app with pathogenicity gauge, score bar chart, SHAP visualization, and AI report tab
 - **Reproducible**: Full training pipeline included (`train.py`)
 
 ---
@@ -63,6 +65,37 @@ Per-feature AUROC contribution (5-fold CV):
 
 ---
 
+## AI Clinical Report (Kimi Integration)
+
+The **AI Clinical Report** tab uses [Kimi (Moonshot AI)](https://platform.moonshot.cn) to synthesize all tool outputs into a structured clinical interpretation report. This is the "reasoning layer" of the SNV-judge agent system:
+
+```
+Tool outputs (VEP + Evo2 + Genos + gnomAD + SHAP)
+        ↓
+  Evidence formatting (kimi_report.py)
+        ↓
+  Kimi LLM (moonshot-v1-32k, T=0.3)
+        ↓
+  Structured ACMG-style report (streaming Markdown)
+```
+
+**Report sections:**
+1. Variant basic information (coordinates, gene, protein change)
+2. SNV-judge v4 integrated prediction (calibrated probability)
+3. Multi-dimensional evidence analysis:
+   - Classical tools (SIFT/PP2/AM/CADD) → PP3/BP4 evidence
+   - Genomic foundation models (Evo2/Genos)
+   - Evolutionary conservation (phyloP) → PP3/BP4
+   - Population frequency (gnomAD) → BA1/PM2
+4. SHAP feature contribution analysis
+5. Comprehensive ACMG classification recommendation
+6. Clinical significance and follow-up suggestions
+7. Limitations
+
+**Example output** (TP53 R175H, chr17:7674220 C>T):
+> *综合分类建议：可能致病（Likely Pathogenic，概率 98.5%）*  
+> *支持证据：PP3（SIFT/PP2/AM/CADD/Evo2/Genos/phyloP全部支持）+ PM2（gnomAD未见，AF<1×10⁻⁷）*
+
 ## SHAP Feature Importance
 
 AlphaMissense remains the dominant contributor, followed by CADD and PolyPhen-2. **gnomAD log-AF** is the strongest new feature — variants absent from gnomAD (AF=0, PM2 signal) are strongly enriched for pathogenicity. **phyloP** captures evolutionary constraint orthogonal to sequence-based tools.
@@ -75,9 +108,10 @@ AlphaMissense remains the dominant contributor, followed by CADD and PolyPhen-2.
 
 ```
 SNV-judge/
-├── app.py                          # Streamlit web application (v4)
+├── app.py                          # Streamlit web application (v4 + AI report)
+├── kimi_report.py                  # Kimi LLM clinical report generation module
 ├── train.py                        # Full training pipeline (data → model → evaluation)
-├── requirements.txt                # Python dependencies
+├── requirements.txt                # Python dependencies (includes openai>=1.0)
 ├── SNV_judge_opening_defense.pptx  # Opening defense presentation (13 slides)
 ├── xgb_model_v4.pkl                # Trained stacking classifier (v4, 8 features)
 ├── platt_scaler_v4.pkl             # Platt calibration scaler (v4)
@@ -122,14 +156,17 @@ SNV-judge/
 pip install -r requirements.txt
 ```
 
-### 2. Set API keys (required for Evo2 + Genos scoring)
+### 2. Set API keys (required for Evo2 + Genos scoring and AI report)
 
 ```bash
 export EVO2_API_KEY="your-nvidia-nim-api-key"    # https://build.nvidia.com/arc-institute/evo2
 export GENOS_API_KEY="your-stomics-api-key"       # https://cloud.stomics.tech
+export KIMI_API_KEY="sk-..."                      # https://platform.moonshot.cn — enables AI clinical report
 ```
 
-> Without API keys, the app falls back to the 4-feature base model (SIFT, PolyPhen, AlphaMissense, CADD).
+> Without Evo2/Genos keys, the app falls back to the 4-feature base model (SIFT, PolyPhen, AlphaMissense, CADD).  
+> Without `KIMI_API_KEY`, the AI Clinical Report tab is disabled (all other features remain functional).  
+> The Kimi API key can also be entered directly in the app's Settings panel without restarting.
 
 ### 3. Run the Streamlit app
 

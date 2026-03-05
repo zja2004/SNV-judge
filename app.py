@@ -13,6 +13,7 @@ AUROC = 0.9664 [0.958–0.972]  |  AUPRC = 0.9671 [0.956–0.973]
 Run:
   export EVO2_API_KEY="nvapi-..."    # optional — enables Evo2 scoring
   export GENOS_API_KEY="sk-..."      # optional — enables Genos scoring
+  export KIMI_API_KEY="sk-..."       # optional — enables AI clinical report (Kimi)
   streamlit run app.py
 """
 
@@ -42,6 +43,12 @@ st.set_page_config(
 # ── API keys (from environment variables) ─────────────────────────────────
 EVO2_API_KEY  = os.environ.get("EVO2_API_KEY", "")
 GENOS_API_KEY = os.environ.get("GENOS_API_KEY", "")
+KIMI_API_KEY  = os.environ.get("KIMI_API_KEY", "")
+
+# Inject KIMI_API_KEY into kimi_report module at import time
+import kimi_report as _kimi_mod
+if KIMI_API_KEY:
+    _kimi_mod.KIMI_API_KEY = KIMI_API_KEY
 EVO2_URL    = "https://health.api.nvidia.com/v1/biology/arc/evo2-40b/generate"
 GENOS_URL   = "https://cloud.stomics.tech/api/aigateway/genos/variant_predict"
 GNOMAD_URL  = "https://gnomad.broadinstitute.org/api"
@@ -610,11 +617,12 @@ model_badge = _ver_labels.get(MODEL_VER, MODEL_VER)
 ai_status   = []
 if EVO2_API_KEY:  ai_status.append("Evo2 ✓")
 if GENOS_API_KEY: ai_status.append("Genos ✓")
+if KIMI_API_KEY:  ai_status.append("Kimi ✓")
 ai_badge = " · ".join(ai_status) if ai_status else "AI models disabled (no API keys)"
 
 st.title("🧬 SNV Pathogenicity Predictor")
 st.markdown(
-    f"**Model**: {model_badge} &nbsp;|&nbsp; **AI scoring**: {ai_badge}  \n"
+    f"**Model**: {model_badge} &nbsp;|&nbsp; **AI**: {ai_badge}  \n"
     "Ensemble meta-model integrating **SIFT · PolyPhen-2 · AlphaMissense · CADD** "
     "+ **Evo2-40B** (NVIDIA NIM) + **Genos-10B** (Stomics) + **phyloP** (conservation) "
     "+ **gnomAD v4 AF** (population frequency).  \n"
@@ -623,8 +631,12 @@ st.markdown(
 )
 st.divider()
 
-# ── Tabs: Single variant | Batch VCF ─────────────────────────────────────
-tab_single, tab_batch = st.tabs(["🔬 Single Variant", "📂 Batch VCF"])
+# ── Tabs: Single variant | Batch VCF | AI Report ──────────────────────────
+tab_single, tab_batch, tab_report = st.tabs([
+    "🔬 Single Variant",
+    "📂 Batch VCF",
+    "🤖 AI Clinical Report",
+])
 
 # ════════════════════════════════════════════════════════════════════════
 # TAB 1: Single variant
@@ -719,6 +731,47 @@ with tab_single:
             st.subheader("SHAP Feature Contributions")
             st.pyplot(make_shap_bars(shap_vals), use_container_width=True)
             st.caption("Red → pathogenic · Blue → benign · Length = magnitude")
+
+        st.divider()
+
+        # ── AI Clinical Report button (inline, inside single-variant results) ──
+        st.subheader("🤖 AI 智能临床解读")
+        if not KIMI_API_KEY:
+            st.info(
+                "设置 `KIMI_API_KEY` 环境变量以启用 Kimi AI 临床报告生成。  \n"
+                "```bash\nexport KIMI_API_KEY='sk-...'\n```"
+            )
+        else:
+            if st.button("✨ 生成 AI 临床解读报告", type="secondary", use_container_width=False):
+                variant_info = {
+                    "chrom": chrom_clean, "pos": int(pos), "ref": ref, "alt": alt,
+                }
+                # Store results in session state for the AI Report tab
+                st.session_state["last_variant_info"]   = variant_info
+                st.session_state["last_scores"]         = scores
+                st.session_state["last_shap_vals"]      = shap_vals
+                st.session_state["last_cal_prob"]       = cal_prob
+                st.session_state["last_evo2_llr"]       = evo2_llr
+                st.session_state["last_genos_path"]     = genos_path
+                st.session_state["last_gnomad_log_af"]  = gnomad_log_af
+                st.session_state["last_model_ver"]      = MODEL_VER
+                st.session_state["trigger_report"]      = True
+
+                with st.spinner("Kimi 正在生成临床解读报告…"):
+                    report_placeholder = st.empty()
+                    full_report = ""
+                    try:
+                        for chunk in _kimi_mod.generate_report_stream(
+                            variant_info, scores, shap_vals, cal_prob,
+                            evo2_llr, genos_path, gnomad_log_af, MODEL_VER,
+                        ):
+                            full_report += chunk
+                            report_placeholder.markdown(full_report + "▌")
+                        report_placeholder.markdown(full_report)
+                        st.session_state["last_report"] = full_report
+                        st.success("报告生成完成！可在「🤖 AI Clinical Report」标签页查看完整报告。")
+                    except Exception as e:
+                        st.error(f"Kimi API 调用失败: {e}")
 
         st.divider()
         with st.expander("Raw scores table"):
@@ -925,11 +978,190 @@ with tab_batch:
 ```
         """)
 
+# ════════════════════════════════════════════════════════════════════════
+# TAB 3: AI Clinical Report
+# ════════════════════════════════════════════════════════════════════════
+with tab_report:
+    st.subheader("🤖 AI 智能临床变异解读报告")
+    st.markdown(
+        "本模块由 **Kimi（Moonshot AI）** 驱动，将 SNV-judge v4 智能体系统的多源证据  \n"
+        "（VEP · Evo2 · Genos · gnomAD · SHAP）转化为结构化 ACMG 风格临床解读报告。"
+    )
+    st.divider()
+
+    # ── API key input (sidebar override) ─────────────────────────────────
+    with st.expander("⚙️ Kimi API 设置", expanded=not bool(KIMI_API_KEY)):
+        kimi_key_input = st.text_input(
+            "Kimi API Key",
+            value=KIMI_API_KEY,
+            type="password",
+            placeholder="sk-...",
+            help="从 https://platform.moonshot.cn 获取 API Key",
+        )
+        if kimi_key_input and kimi_key_input != KIMI_API_KEY:
+            _kimi_mod.KIMI_API_KEY = kimi_key_input
+            st.success("API Key 已更新（本次会话有效）")
+
+        if st.button("🔍 测试 Kimi API 连接"):
+            ok, msg = _kimi_mod.check_kimi_available()
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
+
+    st.divider()
+
+    # ── Manual variant input for report generation ────────────────────────
+    col_left, col_right = st.columns([1, 1])
+
+    with col_left:
+        st.markdown("#### 输入变异信息")
+        st.markdown("*或在「🔬 Single Variant」标签页预测后点击「生成 AI 报告」按钮*")
+
+        r_chrom = st.text_input("染色体", value="17", key="r_chrom")
+        r_pos   = st.number_input("位置 (GRCh38)", value=7674220, min_value=1, key="r_pos")
+        r_ref   = st.text_input("REF", value="C", key="r_ref").upper().strip()
+        r_alt   = st.text_input("ALT", value="T", key="r_alt").upper().strip()
+
+        st.markdown("**快速示例**")
+        ex_cols = st.columns(3)
+        if ex_cols[0].button("TP53 R175H", key="ex_tp53"):
+            st.session_state.update({"r_chrom": "17", "r_pos": 7674220,
+                                     "r_ref": "C", "r_alt": "T"})
+            st.rerun()
+        if ex_cols[1].button("BRCA1 R1699W", key="ex_brca1"):
+            st.session_state.update({"r_chrom": "17", "r_pos": 43057062,
+                                     "r_ref": "C", "r_alt": "T"})
+            st.rerun()
+        if ex_cols[2].button("BRCA2 N372H", key="ex_brca2"):
+            st.session_state.update({"r_chrom": "13", "r_pos": 32906729,
+                                     "r_ref": "C", "r_alt": "A"})
+            st.rerun()
+
+        generate_btn = st.button(
+            "🚀 获取评分并生成 AI 报告",
+            type="primary",
+            use_container_width=True,
+            key="gen_report_btn",
+        )
+
+    with col_right:
+        st.markdown("#### 报告说明")
+        st.markdown("""
+**报告包含以下内容：**
+
+1. **变异基本信息** — 坐标、基因、蛋白变化
+2. **集成预测结果** — SNV-judge v4 校准概率
+3. **多维度证据分析**
+   - 经典工具（SIFT/PP2/AM/CADD）→ PP3/BP4
+   - 基因组基础模型（Evo2/Genos）
+   - 进化保守性（phyloP）→ PP3/BP4
+   - 人群频率（gnomAD）→ BA1/PM2
+4. **SHAP 特征贡献** — 哪个工具最关键
+5. **综合 ACMG 分类建议**
+6. **临床意义与后续建议**
+
+**模型**: `moonshot-v1-32k`  
+**温度**: 0.3（低随机性，保证一致性）
+        """)
+
+    # ── Generate report ───────────────────────────────────────────────────
+    if generate_btn or st.session_state.get("trigger_report"):
+        st.session_state["trigger_report"] = False
+
+        # Use session state data if available (from single-variant tab)
+        if st.session_state.get("last_variant_info") and not generate_btn:
+            v_info      = st.session_state["last_variant_info"]
+            v_scores    = st.session_state["last_scores"]
+            v_shap      = st.session_state["last_shap_vals"]
+            v_prob      = st.session_state["last_cal_prob"]
+            v_evo2      = st.session_state["last_evo2_llr"]
+            v_genos     = st.session_state["last_genos_path"]
+            v_gnomad    = st.session_state["last_gnomad_log_af"]
+            v_model_ver = st.session_state["last_model_ver"]
+        else:
+            # Fresh fetch from manual input
+            chrom_r = r_chrom.replace("chr", "")
+            if not _kimi_mod.KIMI_API_KEY:
+                st.error("请先设置 Kimi API Key（见上方设置面板）")
+                st.stop()
+
+            with st.spinner(f"正在获取 {chrom_r}:{r_pos} {r_ref}>{r_alt} 的评分…"):
+                v_scores = fetch_vep_scores(chrom_r, int(r_pos), r_ref, r_alt)
+                if "error" in v_scores:
+                    st.error(f"VEP 错误: {v_scores['error']}")
+                    st.stop()
+                v_evo2, v_genos, v_gnomad = np.nan, np.nan, np.nan
+                if MODEL_VER in ("v2", "v3", "v4"):
+                    v_evo2, v_genos, v_gnomad = fetch_ai_scores(
+                        chrom_r, int(r_pos), r_ref, r_alt)
+                _, v_prob, v_shap = predict(v_scores, v_evo2, v_genos, v_gnomad)
+                v_info      = {"chrom": chrom_r, "pos": int(r_pos),
+                               "ref": r_ref, "alt": r_alt}
+                v_model_ver = MODEL_VER
+
+        # Check if we already have a cached report
+        cached = st.session_state.get("last_report", "")
+        if cached and not generate_btn:
+            st.markdown(cached)
+        else:
+            if not _kimi_mod.KIMI_API_KEY:
+                st.error("请先设置 Kimi API Key（见上方设置面板）")
+                st.stop()
+
+            st.markdown("---")
+            st.markdown(f"**变异**: chr{v_info['chrom']}:{v_info['pos']} "
+                        f"{v_info['ref']}>{v_info['alt']}  |  "
+                        f"**基因**: {v_scores.get('gene', '?')}  |  "
+                        f"**概率**: {v_prob:.1%}")
+            st.markdown("---")
+
+            report_area = st.empty()
+            full_report = ""
+            try:
+                with st.spinner("Kimi 正在分析多源证据，生成临床解读报告…"):
+                    for chunk in _kimi_mod.generate_report_stream(
+                        v_info, v_scores, v_shap, v_prob,
+                        v_evo2, v_genos, v_gnomad, v_model_ver,
+                    ):
+                        full_report += chunk
+                        report_area.markdown(full_report + "▌")
+                    report_area.markdown(full_report)
+                    st.session_state["last_report"] = full_report
+
+                # Download button
+                st.download_button(
+                    label="⬇️ 下载报告（Markdown）",
+                    data=full_report,
+                    file_name=f"snv_report_{v_info['chrom']}_{v_info['pos']}"
+                              f"_{v_info['ref']}_{v_info['alt']}.md",
+                    mime="text/markdown",
+                )
+            except Exception as e:
+                st.error(f"Kimi API 调用失败: {str(e)}")
+                st.info("请检查 API Key 是否正确，或稍后重试。")
+
+    elif not st.session_state.get("last_report"):
+        st.info(
+            "👆 在左侧输入变异信息并点击「获取评分并生成 AI 报告」，  \n"
+            "或在「🔬 Single Variant」标签页完成预测后点击「生成 AI 临床解读报告」按钮。"
+        )
+    else:
+        # Show cached report from previous run
+        st.markdown(st.session_state["last_report"])
+        st.download_button(
+            label="⬇️ 下载报告（Markdown）",
+            data=st.session_state["last_report"],
+            file_name="snv_report.md",
+            mime="text/markdown",
+        )
+
 # ── Footer ────────────────────────────────────────────────────────────────
 st.markdown("---")
 st.caption(
     "Data: ClinVar · Ensembl VEP · AlphaMissense (Google DeepMind) · CADD v1.7 · "
     "Evo2 (Arc Institute / NVIDIA) · Genos (Zhejiang Lab) · SIFT · PolyPhen-2 · gnomAD v4.  \n"
+    "AI Report: Kimi (Moonshot AI, moonshot-v1-32k). "
     "Model trained on GRCh38 ClinVar gold-standard missense variants. "
     "**Not validated for clinical use.**"
 )
