@@ -153,6 +153,22 @@ To retrain v4 using pre-computed scores (no API keys needed):
 python train.py --use-cache
 ```
 
+### Data Provenance
+
+All pre-computed scores were generated in **March 2026**. Exact API versions and endpoints used:
+
+| Score | API / Source | Version / Dataset | Endpoint | Date |
+|-------|-------------|-------------------|----------|------|
+| **Evo2 LLR** | NVIDIA NIM | `evo2-40b` | `https://health.api.nvidia.com/v1/biology/arc/evo2-40b/generate` | 2026-03-04 |
+| **Genos Score** | Stomics Cloud | `genos` (variant_predict) | `https://cloud.stomics.tech/api/aigateway/genos/variant_predict` | 2026-03-04 |
+| **SIFT / PolyPhen-2 / AlphaMissense / CADD / phyloP** | Ensembl VEP REST API | GRCh38 / e113 | `https://rest.ensembl.org/vep/human/region` | 2026-03-04 |
+| **gnomAD AF** | gnomAD GraphQL API | gnomAD r4 (`gnomad_r4`) | `https://gnomad.broadinstitute.org/api` | 2026-03-05 |
+| **ClinVar variants** | ClinVar FTP | Accessed March 2026 | `variant_summary.txt.gz` | 2026-03-04 |
+
+> **Reproducibility note**: Evo2 and Genos API outputs may change as model weights are updated by their respective providers. The pre-computed `scoring_ckpt.pkl` captures the exact scores used to train v4. If you regenerate scores with newer API versions, results may differ slightly from the reported AUROC = 0.9664.
+>
+> Ensembl VEP annotations (SIFT, PolyPhen-2, AlphaMissense, CADD, phyloP) are tied to Ensembl release e113 / GRCh38. gnomAD AF values reflect gnomAD v4.1 population frequencies.
+
 ## Retrain the Model
 
 To reproduce the full pipeline from scratch:
