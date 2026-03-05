@@ -81,6 +81,12 @@ SNV-judge/
 ├── platt_scaler_v2.pkl         # v2 Platt scaler
 ├── train_medians_v2.pkl        # v2 medians
 ├── data/
+│   ├── feature_matrix_v4.xlsx  # Complete 2,000-variant feature matrix (all scores)
+│   ├── feature_matrix_v4.csv   # Same as above in CSV format
+│   ├── scoring_ckpt.pkl        # Pre-computed Evo2 LLR + Genos scores (1,677/2,000)
+│   ├── vep_scores.pkl          # Pre-computed VEP scores (SIFT/PP2/AM/CADD, 10,542 variants)
+│   ├── phylop_cache.pkl        # Pre-computed phyloP scores (1,922/2,000)
+│   ├── gnomad_af_cache.pkl     # Pre-computed gnomAD v4 AF (2,000 entries, 739 non-zero)
 │   ├── model_metrics_v4.csv    # v4 AUROC/AUPRC with bootstrap 95% CIs
 │   ├── model_metrics_v3.csv    # v3 metrics (legacy)
 │   └── model_metrics_v2.csv    # v2 metrics (legacy)
@@ -129,6 +135,23 @@ Open `http://localhost:8501` in your browser.
 | chr13:32906729 C>A | BRCA2 N372H | Benign |
 
 ---
+
+## Pre-computed Scores (No API Keys Required)
+
+All intermediate scores used to train v4 are included in `data/`:
+
+| File | Contents | Coverage |
+|------|----------|----------|
+| `scoring_ckpt.pkl` | Evo2-40B LLR + Genos-10B pathogenicity scores | 1,677/2,000 (83.9%) |
+| `vep_scores.pkl` | SIFT · PolyPhen-2 · AlphaMissense · CADD (all 10,542 ClinVar variants) | 95–100% |
+| `phylop_cache.pkl` | phyloP conservation scores via Ensembl VEP | 1,922/2,000 (96.1%) |
+| `gnomad_af_cache.pkl` | gnomAD v4 allele frequencies | 2,000 entries (739 non-zero) |
+| `feature_matrix_v4.xlsx` | Complete feature matrix ready for training | 2,000 variants × 22 columns |
+
+To retrain v4 using pre-computed scores (no API keys needed):
+```bash
+python train.py --use-cache
+```
 
 ## Retrain the Model
 
