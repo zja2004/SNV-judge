@@ -96,6 +96,41 @@ Tool outputs (VEP + Evo2 + Genos + gnomAD + SHAP)
 > *综合分类建议：可能致病（Likely Pathogenic，概率 98.5%）*  
 > *支持证据：PP3（SIFT/PP2/AM/CADD/Evo2/Genos/phyloP全部支持）+ PM2（gnomAD未见，AF<1×10⁻⁷）*
 
+---
+
+## Future Vision: Plan C — Multi-Agent Variant Interpretation System
+
+The current AI report module (Plan B) is a **static pipeline** — a single LLM call that synthesizes pre-computed tool outputs. The long-term vision is a **LangGraph-based multi-agent system** where an autonomous Planner Agent dynamically orchestrates specialist tool agents:
+
+```
+User natural language query
+        ↓
+  Planner Agent (Kimi K2 / LangGraph)
+  ├── Step 1: VEP Agent      → SIFT · PP2 · AM · CADD · phyloP
+  ├── Step 2: Evo2 Agent     → NVIDIA NIM LLR scoring
+  ├── Step 3: Genos Agent    → Stomics Cloud pathogenicity score
+  ├── Step 4: gnomAD Agent   → GraphQL population frequency
+  ├── Step 5: SNV-judge Agent → Ensemble prediction + SHAP
+  └── Step 6: Report Agent   → ACMG-structured clinical report
+        ↓
+  Multi-turn dialogue · Batch VCF analysis · Long-term memory
+```
+
+![Plan C Architecture](figures/figB3_plan_c_vision.png)
+
+**Key upgrades over Plan B:**
+
+| Dimension | Plan B (implemented) | Plan C (vision) |
+|-----------|---------------------|-----------------|
+| Architecture | Static pipeline | LangGraph multi-agent |
+| Reasoning | Single LLM call | Autonomous multi-step planning |
+| Tool calling | Fixed order | Dynamic orchestration |
+| Dialogue | None | Multi-turn conversation |
+| Memory | None | Short-term + long-term |
+| Batch analysis | Per-variant | Automatic VCF prioritization |
+
+---
+
 ## SHAP Feature Importance
 
 AlphaMissense remains the dominant contributor, followed by CADD and PolyPhen-2. **gnomAD log-AF** is the strongest new feature — variants absent from gnomAD (AF=0, PM2 signal) are strongly enriched for pathogenicity. **phyloP** captures evolutionary constraint orthogonal to sequence-based tools.
@@ -108,11 +143,11 @@ AlphaMissense remains the dominant contributor, followed by CADD and PolyPhen-2.
 
 ```
 SNV-judge/
-├── app.py                          # Streamlit web application (v4 + AI report)
-├── kimi_report.py                  # Kimi LLM clinical report generation module
-├── train.py                        # Full training pipeline (data → model → evaluation)
-├── requirements.txt                # Python dependencies (includes openai>=1.0)
-├── SNV_judge_opening_defense.pptx  # Opening defense presentation (13 slides)
+├── app.py                              # Streamlit web application (v4 + AI report)
+├── kimi_report.py                      # Kimi LLM clinical report generation module
+├── train.py                            # Full training pipeline (data → model → evaluation)
+├── requirements.txt                    # Python dependencies (includes openai>=1.0)
+├── SNV_judge_opening_defense_v2.pptx   # Opening defense presentation (16 slides, with Plan B demo & Plan C vision)
 ├── xgb_model_v4.pkl                # Trained stacking classifier (v4, 8 features)
 ├── platt_scaler_v4.pkl             # Platt calibration scaler (v4)
 ├── train_medians_v4.pkl            # Training set medians (for NaN imputation, v4)
@@ -134,16 +169,19 @@ SNV-judge/
 │   ├── model_metrics_v3.csv        # v3 metrics (legacy)
 │   └── model_metrics_v2.csv        # v2 metrics (legacy)
 └── figures/
-    ├── fig1_roc_comparison.png/svg  # ROC + PR curves — all versions vs baselines
-    ├── fig2_ablation.png/svg        # Ablation study — per-feature AUROC contribution
-    ├── fig3_data_distribution.png/svg  # Training set: label balance, chromosomes, top genes
-    ├── fig4_architecture.png/svg    # System architecture & data pipeline diagram
-    ├── model_curves_v4.png/svg      # ROC + PR curves (v4 vs v3, legacy)
-    ├── shap_analysis_v4.png/svg     # SHAP beeswarm + bar plots (8 features)
-    ├── model_curves_v3.png/svg      # v3 curves (legacy)
-    ├── shap_analysis_v3.png/svg     # v3 SHAP (legacy)
-    ├── model_curves_v2.png/svg      # v2 curves (legacy)
-    └── shap_analysis_v2.png/svg     # v2 SHAP (legacy)
+    ├── fig1_roc_comparison.png/svg      # ROC + PR curves — all versions vs baselines
+    ├── fig2_ablation.png/svg            # Ablation study — per-feature AUROC contribution
+    ├── fig3_data_distribution.png/svg   # Training set: label balance, chromosomes, top genes
+    ├── fig4_architecture.png/svg        # System architecture & data pipeline diagram
+    ├── figB1_agent_workflow.png/svg     # Agent pipeline diagram (5-stage, Plan B)
+    ├── figB2_report_demo.png/svg        # AI report demo: TP53 R175H vs BRCA2 N372H comparison
+    ├── figB3_plan_c_vision.png/svg      # Plan C multi-agent architecture vision (LangGraph)
+    ├── model_curves_v4.png/svg          # ROC + PR curves (v4 vs v3, legacy)
+    ├── shap_analysis_v4.png/svg         # SHAP beeswarm + bar plots (8 features)
+    ├── model_curves_v3.png/svg          # v3 curves (legacy)
+    ├── shap_analysis_v3.png/svg         # v3 SHAP (legacy)
+    ├── model_curves_v2.png/svg          # v2 curves (legacy)
+    └── shap_analysis_v2.png/svg         # v2 SHAP (legacy)
 ```
 
 ---
