@@ -51,7 +51,15 @@ Bootstrap 95% confidence intervals (n=1,000 resamples).
 
 ### ROC & Precision-Recall Curves
 
-![Model Curves](figures/model_curves_v4.png)
+Full comparison across all model versions and single-tool baselines (AlphaMissense, CADD):
+
+![Model Curves — All Versions](figures/fig1_roc_comparison.png)
+
+### Ablation Study
+
+Per-feature AUROC contribution (5-fold CV):
+
+![Ablation Study](figures/fig2_ablation.png)
 
 ---
 
@@ -67,36 +75,41 @@ AlphaMissense remains the dominant contributor, followed by CADD and PolyPhen-2.
 
 ```
 SNV-judge/
-├── app.py                      # Streamlit web application (v4)
-├── train.py                    # Full training pipeline (data → model → evaluation)
-├── requirements.txt            # Python dependencies
-├── xgb_model_v4.pkl            # Trained stacking classifier (v4, 8 features)
-├── platt_scaler_v4.pkl         # Platt calibration scaler (v4)
-├── train_medians_v4.pkl        # Training set medians (for NaN imputation, v4)
-├── feature_cols_v4.pkl         # Feature column names (v4)
-├── xgb_model_v3.pkl            # v3 model (7 features, kept for fallback)
-├── platt_scaler_v3.pkl         # v3 Platt scaler
-├── train_medians_v3.pkl        # v3 medians
-├── xgb_model_v2.pkl            # v2 model (6 features, kept for fallback)
-├── platt_scaler_v2.pkl         # v2 Platt scaler
-├── train_medians_v2.pkl        # v2 medians
+├── app.py                          # Streamlit web application (v4)
+├── train.py                        # Full training pipeline (data → model → evaluation)
+├── requirements.txt                # Python dependencies
+├── SNV_judge_opening_defense.pptx  # Opening defense presentation (13 slides)
+├── xgb_model_v4.pkl                # Trained stacking classifier (v4, 8 features)
+├── platt_scaler_v4.pkl             # Platt calibration scaler (v4)
+├── train_medians_v4.pkl            # Training set medians (for NaN imputation, v4)
+├── feature_cols_v4.pkl             # Feature column names (v4)
+├── xgb_model_v3.pkl                # v3 model (7 features, kept for fallback)
+├── platt_scaler_v3.pkl             # v3 Platt scaler
+├── train_medians_v3.pkl            # v3 medians
+├── xgb_model_v2.pkl                # v2 model (6 features, kept for fallback)
+├── platt_scaler_v2.pkl             # v2 Platt scaler
+├── train_medians_v2.pkl            # v2 medians
 ├── data/
-│   ├── feature_matrix_v4.xlsx  # Complete 2,000-variant feature matrix (all scores)
-│   ├── feature_matrix_v4.csv   # Same as above in CSV format
-│   ├── scoring_ckpt.pkl        # Pre-computed Evo2 LLR + Genos scores (1,677/2,000)
-│   ├── vep_scores.pkl          # Pre-computed VEP scores (SIFT/PP2/AM/CADD, 10,542 variants)
-│   ├── phylop_cache.pkl        # Pre-computed phyloP scores (1,922/2,000)
-│   ├── gnomad_af_cache.pkl     # Pre-computed gnomAD v4 AF (2,000 entries, 739 non-zero)
-│   ├── model_metrics_v4.csv    # v4 AUROC/AUPRC with bootstrap 95% CIs
-│   ├── model_metrics_v3.csv    # v3 metrics (legacy)
-│   └── model_metrics_v2.csv    # v2 metrics (legacy)
+│   ├── feature_matrix_v4.xlsx      # Complete 2,000-variant feature matrix (all scores)
+│   ├── feature_matrix_v4.csv       # Same as above in CSV format
+│   ├── scoring_ckpt.pkl            # Pre-computed Evo2 LLR + Genos scores (1,677/2,000)
+│   ├── vep_scores.pkl              # Pre-computed VEP scores (SIFT/PP2/AM/CADD, 10,542 variants)
+│   ├── phylop_cache.pkl            # Pre-computed phyloP scores (1,922/2,000)
+│   ├── gnomad_af_cache.pkl         # Pre-computed gnomAD v4 AF (2,000 entries, 739 non-zero)
+│   ├── model_metrics_v4.csv        # v4 AUROC/AUPRC with bootstrap 95% CIs
+│   ├── model_metrics_v3.csv        # v3 metrics (legacy)
+│   └── model_metrics_v2.csv        # v2 metrics (legacy)
 └── figures/
-    ├── model_curves_v4.png/svg     # ROC + PR curves (v4 vs v3)
-    ├── shap_analysis_v4.png/svg    # SHAP beeswarm + bar plots (8 features)
-    ├── model_curves_v3.png/svg     # v3 curves (legacy)
-    ├── shap_analysis_v3.png/svg    # v3 SHAP (legacy)
-    ├── model_curves_v2.png/svg     # v2 curves (legacy)
-    └── shap_analysis_v2.png/svg    # v2 SHAP (legacy)
+    ├── fig1_roc_comparison.png/svg  # ROC + PR curves — all versions vs baselines
+    ├── fig2_ablation.png/svg        # Ablation study — per-feature AUROC contribution
+    ├── fig3_data_distribution.png/svg  # Training set: label balance, chromosomes, top genes
+    ├── fig4_architecture.png/svg    # System architecture & data pipeline diagram
+    ├── model_curves_v4.png/svg      # ROC + PR curves (v4 vs v3, legacy)
+    ├── shap_analysis_v4.png/svg     # SHAP beeswarm + bar plots (8 features)
+    ├── model_curves_v3.png/svg      # v3 curves (legacy)
+    ├── shap_analysis_v3.png/svg     # v3 SHAP (legacy)
+    ├── model_curves_v2.png/svg      # v2 curves (legacy)
+    └── shap_analysis_v2.png/svg     # v2 SHAP (legacy)
 ```
 
 ---
