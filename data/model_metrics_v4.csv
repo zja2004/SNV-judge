@@ -1,0 +1,2 @@
+version,n_train,n_features,auroc_mean,auroc_ci_lo,auroc_ci_hi,auprc_mean,auprc_ci_lo,auprc_ci_hi
+v4,2000,8,0.9664,0.958,0.972,0.9671,0.956,0.973

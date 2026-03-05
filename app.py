@@ -1,13 +1,14 @@
 """
-SNV Pathogenicity Predictor — v3
+SNV Pathogenicity Predictor — v4
 =================================
 Ensemble meta-model (XGBoost + LightGBM Stacking, Platt-calibrated) integrating:
   Classical:    SIFT · PolyPhen-2 · AlphaMissense · CADD
   Foundation:   Evo2-40B (NVIDIA NIM) · Genos-10B (Stomics)
   Conservation: phyloP (Ensembl VEP)
+  Population:   gnomAD v4 allele frequency
 
 Trained on 2,000 ClinVar missense variants across 547 genes (5-fold CV).
-AUROC = 0.9386 [0.929–0.949]  |  AUPRC = 0.9328 [0.918–0.945]
+AUROC = 0.9664 [0.958–0.972]  |  AUPRC = 0.9671 [0.956–0.973]
 
 Run:
   export EVO2_API_KEY="nvapi-..."    # optional — enables Evo2 scoring
@@ -33,7 +34,7 @@ import streamlit as st
 
 # ── Page config ───────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="SNV Pathogenicity Predictor v3",
+    page_title="SNV Pathogenicity Predictor v4",
     page_icon="🧬",
     layout="wide",
 )
@@ -41,24 +42,26 @@ st.set_page_config(
 # ── API keys (from environment variables) ─────────────────────────────────
 EVO2_API_KEY  = os.environ.get("EVO2_API_KEY", "")
 GENOS_API_KEY = os.environ.get("GENOS_API_KEY", "")
-EVO2_URL  = "https://health.api.nvidia.com/v1/biology/arc/evo2-40b/generate"
-GENOS_URL = "https://cloud.stomics.tech/api/aigateway/genos/variant_predict"
+EVO2_URL    = "https://health.api.nvidia.com/v1/biology/arc/evo2-40b/generate"
+GENOS_URL   = "https://cloud.stomics.tech/api/aigateway/genos/variant_predict"
+GNOMAD_URL  = "https://gnomad.broadinstitute.org/api"
 ENSEMBL_SEQ_URL = "https://rest.ensembl.org/sequence/region/human"
 
 # ── Feature definitions ───────────────────────────────────────────────────
 FEATURE_COLS   = ["sift_score_inv", "polyphen_score", "am_pathogenicity",
-                  "cadd_phred", "evo2_llr", "genos_path", "phylop"]
+                  "cadd_phred", "evo2_llr", "genos_path", "phylop", "gnomad_log_af"]
 FEATURE_LABELS = ["SIFT (inv)", "PolyPhen-2", "AlphaMissense",
-                  "CADD Phred", "Evo2 LLR", "Genos Score", "phyloP"]
-FEATURE_COLORS = ["#0072B2", "#E69F00", "#009E73", "#CC79A7", "#56B4E9", "#D55E00", "#75A025"]
+                  "CADD Phred", "Evo2 LLR", "Genos Score", "phyloP", "gnomAD log-AF"]
+FEATURE_COLORS = ["#0072B2", "#E69F00", "#009E73", "#CC79A7",
+                  "#56B4E9", "#D55E00", "#75A025", "#E9ED4C"]
 
 # ── Load model artefacts ──────────────────────────────────────────────────
 BASE = Path(__file__).parent
 
 @st.cache_resource
 def load_artefacts():
-    """Load model artefacts: v3 → v2 → v1 fallback chain."""
-    for suffix, ver in [("_v3", "v3"), ("_v2", "v2"), ("", "v1")]:
+    """Load model artefacts: v4 → v3 → v2 → v1 fallback chain."""
+    for suffix, ver in [("_v4", "v4"), ("_v3", "v3"), ("_v2", "v2"), ("", "v1")]:
         try:
             with open(BASE / f"xgb_model{suffix}.pkl", "rb") as f:
                 model = pickle.load(f)
@@ -135,6 +138,43 @@ def fetch_vep_scores(chrom: str, pos: int, ref: str, alt: str) -> dict:
                     "Scores may be absent or unreliable.")
                    if "missense_variant" not in csq else None,
     }
+
+def fetch_gnomad_af(chrom: str, pos: int, ref: str, alt: str) -> float:
+    """Fetch gnomAD v4 allele frequency for a variant. Returns log10(AF+1e-8)."""
+    query = """
+    query V($vid: String!) {
+      variant(variantId: $vid, dataset: gnomad_r4) {
+        exome  { af }
+        genome { af }
+      }
+    }
+    """
+    vid = f"{chrom}-{pos}-{ref}-{alt}"
+    for attempt in range(3):
+        try:
+            r = requests.post(
+                GNOMAD_URL,
+                json={"query": query, "variables": {"vid": vid}},
+                headers={"Content-Type": "application/json"},
+                timeout=15,
+            )
+            if r.status_code == 200:
+                d = r.json().get("data", {}).get("variant")
+                if d:
+                    vals = []
+                    if d.get("exome")  and d["exome"].get("af")  is not None:
+                        vals.append(d["exome"]["af"])
+                    if d.get("genome") and d["genome"].get("af") is not None:
+                        vals.append(d["genome"]["af"])
+                    af = max(vals) if vals else 0.0
+                else:
+                    af = 0.0  # variant absent from gnomAD (PM2 signal)
+                return float(np.log10(af + 1e-8))
+            time.sleep(2 ** attempt)
+        except Exception:
+            time.sleep(2 ** attempt)
+    return np.nan  # API unavailable
+
 
 def fetch_vep_batch(variants: list[dict]) -> list[dict]:
     """Batch VEP call for up to 200 variants at once."""
@@ -220,20 +260,21 @@ def genos_score_variant(chrom: str, pos: int, ref: str, alt: str) -> dict:
             time.sleep(2)
     return {"genos_path": np.nan}
 
-def fetch_ai_scores(chrom: str, pos: int, ref: str, alt: str) -> tuple[float, float]:
-    """Fetch Evo2 LLR and Genos score in parallel. Returns (evo2_llr, genos_path)."""
-    evo2_llr   = np.nan
-    genos_path = np.nan
-    if not EVO2_API_KEY and not GENOS_API_KEY:
-        return evo2_llr, genos_path
+def fetch_ai_scores(chrom: str, pos: int, ref: str, alt: str) -> tuple[float, float, float]:
+    """Fetch Evo2 LLR, Genos score, and gnomAD log-AF in parallel.
+    Returns (evo2_llr, genos_path, gnomad_log_af)."""
+    evo2_llr      = np.nan
+    genos_path    = np.nan
+    gnomad_log_af = np.nan
 
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        fut_genos = ex.submit(genos_score_variant, chrom, pos, ref, alt)
-        # Evo2 needs sequence context
-        fut_seq = ex.submit(fetch_sequence_context, chrom, pos, 50)
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        fut_genos  = ex.submit(genos_score_variant, chrom, pos, ref, alt)
+        fut_gnomad = ex.submit(fetch_gnomad_af, chrom, pos, ref, alt)
+        fut_seq    = ex.submit(fetch_sequence_context, chrom, pos, 50)
 
-        genos_result = fut_genos.result()
-        genos_path   = genos_result.get("genos_path", np.nan)
+        genos_result  = fut_genos.result()
+        genos_path    = genos_result.get("genos_path", np.nan)
+        gnomad_log_af = fut_gnomad.result()
 
         seq = fut_seq.result()
         if seq and len(seq) == 101 and EVO2_API_KEY:
@@ -241,14 +282,16 @@ def fetch_ai_scores(chrom: str, pos: int, ref: str, alt: str) -> tuple[float, fl
             alt_ctx = seq[:50] + alt + seq[51:]
             evo2_llr = evo2_score_variant(ref_ctx, alt_ctx)
 
-    return evo2_llr, genos_path
+    return evo2_llr, genos_path, gnomad_log_af
 
 # ── Prediction ────────────────────────────────────────────────────────────
 def predict(scores: dict, evo2_llr: float = np.nan,
-            genos_path: float = np.nan) -> tuple[float, float, np.ndarray]:
+            genos_path: float = np.nan,
+            gnomad_log_af: float = np.nan) -> tuple[float, float, np.ndarray]:
     """Return (raw_prob, calibrated_prob, shap_values).
 
     Feature set adapts to loaded model version:
+      v4: 8 features (SIFT, PolyPhen, AM, CADD, Evo2, Genos, phyloP, gnomAD log-AF)
       v3: 7 features (SIFT, PolyPhen, AM, CADD, Evo2, Genos, phyloP)
       v2: 6 features (SIFT, PolyPhen, AM, CADD, Evo2, Genos)
       v1: 4 features (SIFT, PolyPhen, AM, CADD)
@@ -289,25 +332,37 @@ def predict(scores: dict, evo2_llr: float = np.nan,
         _get("cadd_phred"),
     ]
 
-    if MODEL_VER in ("v2", "v3"):
+    if MODEL_VER in ("v2", "v3", "v4"):
         feature_vec = base_feats + [
             _ai(evo2_llr,   "evo2_llr"),
             _ai(genos_path, "genos_path"),
         ]
-        if MODEL_VER == "v3":
+        if MODEL_VER in ("v3", "v4"):
             feature_vec.append(_get("phylop"))
+        if MODEL_VER == "v4":
+            feature_vec.append(_ai(gnomad_log_af, "gnomad_log_af"))
     else:
         feature_vec = base_feats
 
     X = np.array([feature_vec])
-    raw_prob  = float(MODEL.predict_proba(X)[0, 1])
+
+    # v4 model is a bundle dict {xgb, lgb, meta}
+    if MODEL_VER == "v4" and isinstance(MODEL, dict):
+        xgb_p = MODEL["xgb"].predict_proba(X)[0, 1]
+        lgb_p = MODEL["lgb"].predict_proba(X)[0, 1]
+        meta_X = np.array([[xgb_p, lgb_p]])
+        raw_prob = float(MODEL["meta"].predict_proba(meta_X)[0, 1])
+    else:
+        raw_prob = float(MODEL.predict_proba(X)[0, 1])
+
     logit_raw = np.log(raw_prob / (1 - raw_prob + 1e-9))
     cal_prob  = float(PLATT.predict_proba([[logit_raw]])[0, 1])
 
-    # SHAP via TreeExplainer on the fly
+    # SHAP via TreeExplainer on XGB base model
     try:
         import shap
-        explainer = shap.TreeExplainer(MODEL)
+        xgb_model = MODEL["xgb"] if isinstance(MODEL, dict) else MODEL
+        explainer = shap.TreeExplainer(xgb_model)
         shap_vals = explainer.shap_values(X)[0]
     except Exception:
         shap_vals = np.zeros(len(feature_vec))
@@ -338,20 +393,25 @@ def make_gauge(prob: float) -> plt.Figure:
     fig.tight_layout(pad=0)
     return fig
 
-def make_score_bars(scores: dict, evo2_llr: float, genos_path: float) -> plt.Figure:
-    feat_labels = FEATURE_LABELS if MODEL_VER in ("v2", "v3") else FEATURE_LABELS[:4]
+def make_score_bars(scores: dict, evo2_llr: float, genos_path: float,
+                    gnomad_log_af: float = np.nan) -> plt.Figure:
+    feat_labels = FEATURE_LABELS if MODEL_VER in ("v2", "v3", "v4") else FEATURE_LABELS[:4]
     sift_inv = (1.0 - scores["sift_score"]) if scores.get("sift_score") is not None else None
     vals  = [sift_inv, scores.get("polyphen_score"),
              scores.get("am_pathogenicity"), scores.get("cadd_phred")]
     maxes = [1, 1, 1, 60]
-    if MODEL_VER in ("v2", "v3"):
+    if MODEL_VER in ("v2", "v3", "v4"):
         vals  += [evo2_llr  if not np.isnan(evo2_llr)   else None,
                   genos_path if not np.isnan(genos_path) else None]
         maxes += [3, 1]   # Evo2 LLR range ~[-3,3]; Genos [0,1]
-    if MODEL_VER == "v3":
+    if MODEL_VER in ("v3", "v4"):
         phylop = scores.get("phylop")
         vals  += [float(phylop) if phylop is not None else None]
         maxes += [6]      # phyloP range ~[-6, 6]
+    if MODEL_VER == "v4":
+        gnomad_val = scores.get("gnomad_log_af")
+        vals  += [float(gnomad_val) if gnomad_val is not None else None]
+        maxes += [8]      # log10(AF+1e-8) range ~[-8, 0]
 
     n = len(feat_labels)
     fig, axes = plt.subplots(n, 1, figsize=(5, 0.85 * n + 0.5))
@@ -480,13 +540,13 @@ def score_vcf_variants(variants: list[dict],
             hgvsp       = chosen.get("hgvsp", "")
             consequence = ", ".join(chosen.get("consequence_terms", []))
 
-        # AI scores
-        evo2_llr, genos_path = np.nan, np.nan
-        if MODEL_VER in ("v2", "v3") and (EVO2_API_KEY or GENOS_API_KEY):
-            evo2_llr, genos_path = fetch_ai_scores(
+        # AI scores + gnomAD AF
+        evo2_llr, genos_path, gnomad_log_af = np.nan, np.nan, np.nan
+        if MODEL_VER in ("v2", "v3", "v4"):
+            evo2_llr, genos_path, gnomad_log_af = fetch_ai_scores(
                 v["chrom"], v["pos"], v["ref"], v["alt"])
 
-        _, cal_prob, shap_vals = predict(scores, evo2_llr, genos_path)
+        _, cal_prob, shap_vals = predict(scores, evo2_llr, genos_path, gnomad_log_af)
 
         return {
             "Chrom":       v["chrom"],
@@ -502,8 +562,9 @@ def score_vcf_variants(variants: list[dict],
             "PolyPhen-2":  scores["polyphen_score"],
             "AlphaMissense": scores["am_pathogenicity"],
             "CADD Phred":  scores["cadd_phred"],
-            "Evo2 LLR":    None if np.isnan(evo2_llr)   else round(float(evo2_llr), 4),
-            "Genos Score": None if np.isnan(genos_path) else round(float(genos_path), 4),
+            "Evo2 LLR":    None if np.isnan(evo2_llr)      else round(float(evo2_llr), 4),
+            "Genos Score": None if np.isnan(genos_path)    else round(float(genos_path), 4),
+            "gnomAD log-AF": None if np.isnan(gnomad_log_af) else round(float(gnomad_log_af), 4),
             "Pathogenicity Prob": round(cal_prob, 4),
             "Classification": ("Likely Pathogenic" if cal_prob >= 0.7
                                else "Uncertain"     if cal_prob >= 0.4
@@ -541,7 +602,8 @@ def score_vcf_variants(variants: list[dict],
 # ══════════════════════════════════════════════════════════════════════════
 # UI
 # ══════════════════════════════════════════════════════════════════════════
-_ver_labels = {"v3": "v3 (Evo2 + Genos + phyloP)",
+_ver_labels = {"v4": "v4 (Evo2 + Genos + phyloP + gnomAD AF)",
+               "v3": "v3 (Evo2 + Genos + phyloP)",
                "v2": "v2 (Evo2 + Genos)",
                "v1": "v1 (4-feature fallback)"}
 model_badge = _ver_labels.get(MODEL_VER, MODEL_VER)
@@ -554,9 +616,10 @@ st.title("🧬 SNV Pathogenicity Predictor")
 st.markdown(
     f"**Model**: {model_badge} &nbsp;|&nbsp; **AI scoring**: {ai_badge}  \n"
     "Ensemble meta-model integrating **SIFT · PolyPhen-2 · AlphaMissense · CADD** "
-    "+ **Evo2-40B** (NVIDIA NIM) + **Genos-10B** (Stomics) + **phyloP** (conservation).  \n"
+    "+ **Evo2-40B** (NVIDIA NIM) + **Genos-10B** (Stomics) + **phyloP** (conservation) "
+    "+ **gnomAD v4 AF** (population frequency).  \n"
     "Trained on 2,000 ClinVar missense variants across 547 genes · "
-    "AUROC = 0.9386 [0.929–0.949]"
+    "AUROC = 0.9664 [0.958–0.972]"
 )
 st.divider()
 
@@ -610,13 +673,13 @@ with tab_single:
         if scores.get("warning"):
             st.warning(scores["warning"])
 
-        evo2_llr, genos_path = np.nan, np.nan
-        if MODEL_VER in ("v2", "v3") and (EVO2_API_KEY or GENOS_API_KEY):
-            with st.spinner("Fetching Evo2 + Genos AI scores…"):
-                evo2_llr, genos_path = fetch_ai_scores(
+        evo2_llr, genos_path, gnomad_log_af = np.nan, np.nan, np.nan
+        if MODEL_VER in ("v2", "v3", "v4"):
+            with st.spinner("Fetching Evo2 + Genos AI scores + gnomAD AF…"):
+                evo2_llr, genos_path, gnomad_log_af = fetch_ai_scores(
                     chrom_clean, int(pos), ref, alt)
 
-        raw_prob, cal_prob, shap_vals = predict(scores, evo2_llr, genos_path)
+        raw_prob, cal_prob, shap_vals = predict(scores, evo2_llr, genos_path, gnomad_log_af)
 
         col1, col2, col3 = st.columns([1.2, 1.1, 1.1])
 
@@ -624,7 +687,8 @@ with tab_single:
             st.subheader("Pathogenicity Score")
             st.pyplot(make_gauge(cal_prob), use_container_width=True)
             _ai_used = MODEL_VER in ("v2", "v3") and not (np.isnan(evo2_llr) and np.isnan(genos_path))
-            _ver_desc = {"v3": "v3 model (Evo2 + Genos + phyloP)",
+            _ver_desc = {"v4": "v4 model (Evo2 + Genos + phyloP + gnomAD AF)",
+                         "v3": "v3 model (Evo2 + Genos + phyloP)",
                          "v2": "v2 model (Evo2 + Genos)",
                          "v1": "base 4-feature model"}
             st.caption(
@@ -646,7 +710,7 @@ with tab_single:
 
         with col2:
             st.subheader("Sub-model Scores")
-            st.pyplot(make_score_bars(scores, evo2_llr, genos_path),
+            st.pyplot(make_score_bars(scores, evo2_llr, genos_path, gnomad_log_af),
                       use_container_width=True)
             st.caption("Dashed line = pathogenicity threshold. N/A = score unavailable; "
                        "training median imputed for prediction.")
@@ -674,15 +738,18 @@ with tab_single:
                 scores.get("am_pathogenicity")  if scores.get("am_pathogenicity")  is not None else _med("am_pathogenicity"),
                 scores.get("cadd_phred")        if scores.get("cadd_phred")        is not None else _med("cadd_phred"),
             ]
-            if MODEL_VER in ("v2", "v3"):
+            if MODEL_VER in ("v2", "v3", "v4"):
                 raw_vals  += [evo2_llr   if not np.isnan(evo2_llr)   else None,
                               genos_path if not np.isnan(genos_path)  else None]
                 used_vals += [evo2_llr   if not np.isnan(evo2_llr)   else _med("evo2_llr"),
                               genos_path if not np.isnan(genos_path)  else _med("genos_path", 0.5)]
-            if MODEL_VER == "v3":
+            if MODEL_VER in ("v3", "v4"):
                 phylop_raw = scores.get("phylop")
                 raw_vals  += [float(phylop_raw) if phylop_raw is not None else None]
                 used_vals += [float(phylop_raw) if phylop_raw is not None else _med("phylop")]
+            if MODEL_VER == "v4":
+                raw_vals  += [gnomad_log_af if not np.isnan(gnomad_log_af) else None]
+                used_vals += [gnomad_log_af if not np.isnan(gnomad_log_af) else _med("gnomad_log_af")]
             st.dataframe(pd.DataFrame({
                 "Feature":       feat_labels,
                 "Raw value":     raw_vals,
@@ -701,11 +768,12 @@ with tab_single:
 4. **Stacking ensemble**: XGBoost + LightGBM meta-model combines all features
 5. **SHAP**: Explains which features drove the prediction
 
-### Model performance (v3, 5-fold CV, n=2,000)
+### Model performance (v4, 5-fold CV, n=2,000)
 | Model | AUROC [95% CI] | AUPRC [95% CI] |
 |---|---|---|
-| **v3 (Evo2 + Genos + phyloP)** | **0.9386 [0.929–0.949]** | **0.9328 [0.918–0.945]** |
-| v2 (Evo2 + Genos, no phyloP) | 0.9373 [0.927–0.947] | 0.9345 [0.921–0.946] |
+| **v4 (+ gnomAD AF)** | **0.9664 [0.958–0.972]** | **0.9671 [0.956–0.973]** |
+| v3 (+ phyloP) | 0.9488 [0.938–0.958] | 0.9447 [0.933–0.955] |
+| v2 (Evo2 + Genos) | 0.9373 [0.927–0.947] | 0.9345 [0.921–0.946] |
 | AlphaMissense alone | 0.9109 [0.898–0.923] | 0.9393 [0.927–0.948] |
 
 ### API key setup
@@ -790,10 +858,13 @@ with tab_batch:
 
                 display_cols = ["Chrom", "Pos", "Ref", "Alt", "Gene", "HGVSp",
                                 "AlphaMissense", "CADD Phred", "Evo2 LLR",
-                                "Genos Score", "Pathogenicity Prob", "Classification"]
-                if MODEL_VER not in ("v2", "v3"):
+                                "Genos Score", "gnomAD log-AF",
+                                "Pathogenicity Prob", "Classification"]
+                if MODEL_VER not in ("v2", "v3", "v4"):
                     display_cols = [c for c in display_cols
-                                    if c not in ("Evo2 LLR", "Genos Score")]
+                                    if c not in ("Evo2 LLR", "Genos Score", "gnomAD log-AF")]
+                elif MODEL_VER != "v4":
+                    display_cols = [c for c in display_cols if c != "gnomAD log-AF"]
 
                 st.dataframe(
                     df_results[display_cols].style.applymap(
@@ -858,7 +929,7 @@ with tab_batch:
 st.markdown("---")
 st.caption(
     "Data: ClinVar · Ensembl VEP · AlphaMissense (Google DeepMind) · CADD v1.7 · "
-    "Evo2 (Arc Institute / NVIDIA) · Genos (Zhejiang Lab) · SIFT · PolyPhen-2.  \n"
+    "Evo2 (Arc Institute / NVIDIA) · Genos (Zhejiang Lab) · SIFT · PolyPhen-2 · gnomAD v4.  \n"
     "Model trained on GRCh38 ClinVar gold-standard missense variants. "
     "**Not validated for clinical use.**"
 )
