@@ -747,12 +747,13 @@ with st.expander("📊 Model Info & Calibration Curve", expanded=False):
 
 st.divider()
 
-# ── Tabs: Single variant | Batch VCF | History | AI Report ───────────────
-tab_single, tab_batch, tab_history, tab_report = st.tabs([
+# ── Tabs: Single variant | Batch VCF | History | AI Report | Agent ────────
+tab_single, tab_batch, tab_history, tab_report, tab_agent = st.tabs([
     "🔬 Single Variant",
     "📂 Batch VCF",
     "📋 History",
     "🤖 AI Clinical Report",
+    "🧠 Agent Chat",
 ])
 
 # ════════════════════════════════════════════════════════════════════════
@@ -1432,6 +1433,21 @@ with tab_report:
             file_name="snv_report.md",
             mime="text/markdown",
         )
+
+# ════════════════════════════════════════════════════════════════════════
+# TAB 5: Agent Chat (Plan C)
+# ════════════════════════════════════════════════════════════════════════
+with tab_agent:
+    try:
+        import sys
+        from pathlib import Path as _Path
+        sys.path.insert(0, str(_Path(__file__).parent))
+        from agent.chat_ui import render_agent_chat_tab
+        render_agent_chat_tab()
+    except ImportError as _e:
+        st.error(f"Agent module not available: {_e}")
+        st.info("Ensure `agent/` directory exists and LangChain is installed: "
+                "`pip install langchain langchain-openai`")
 
 # ── Footer ────────────────────────────────────────────────────────────────
 st.markdown("---")
