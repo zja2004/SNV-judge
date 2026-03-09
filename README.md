@@ -1,4 +1,4 @@
-# SNV-judge v4: Ensemble SNV Pathogenicity Predictor with Genomic Foundation Models
+# SNV-judge v5: Ensemble SNV Pathogenicity Predictor with Genomic Foundation Models
 
 An interpretable ensemble meta-model that integrates classical pathogenicity scoring tools with **state-of-the-art genomic foundation models** — [Evo2](https://arcinstitute.org/manuscripts/Evo2) (Arc Institute / NVIDIA) and [Genos](https://github.com/zhejianglab/Genos) (Zhejiang Lab) — plus **phyloP evolutionary conservation** and **gnomAD v4 population allele frequency** to predict the pathogenicity of human missense SNVs.
 
@@ -8,16 +8,20 @@ Trained on **2,000 ClinVar missense variants** across **547 genes** (balanced 1:
 
 ---
 
-## What's New in v4 + AI Report
+## What's New in v5
 
-| | v1 | v2 | v3 | v4 | **v4 + AI** |
+| | v1 | v2 | v3 | v4 | **v5** |
 |---|---|---|---|---|---|
-| Training variants | 842 (BRCA1/2/TP53) | 1,800 (547 genes) | 2,000 (547 genes) | **2,000 (547 genes)** | **2,000 (547 genes)** |
-| Features | SIFT, PolyPhen, AM, CADD | + Evo2 LLR, Genos Score | + phyloP conservation | + **gnomAD v4 AF** | + **gnomAD v4 AF** |
-| Model | XGBoost | XGBoost + LightGBM Stacking | XGBoost + LightGBM Stacking | XGBoost + LightGBM Stacking | XGBoost + LightGBM Stacking |
-| AUROC | ~0.91 | 0.9373 | 0.9488 | **0.9664** | **0.9664** |
-| Batch VCF | — | — | Yes (up to 500 SNVs) | **Yes** | **Yes** |
-| AI Clinical Report | — | — | — | — | **✓ Kimi (moonshot-v1-32k)** |
+| Training variants | 842 (BRCA1/2/TP53) | 1,800 (547 genes) | 2,000 (547 genes) | 2,000 (547 genes) | **2,000 (547 genes)** |
+| Features | SIFT, PolyPhen, AM, CADD | + Evo2 LLR, Genos Score | + phyloP conservation | + gnomAD v4 AF | **same 8 features** |
+| Calibration | — | Platt | Platt | Platt | **Isotonic Regression** |
+| AUROC (CV) | ~0.91 | 0.9373 | 0.9488 | 0.9664 | **0.9679** |
+| AUROC (holdout) | — | — | — | — | **0.9547** |
+| Brier score | — | — | — | 0.0743 | **0.0685** |
+| ACMG 5-tier badge | — | — | — | — | **✓** |
+| Variant history | — | — | — | — | **✓ (session-level)** |
+| Calibration curve | — | — | — | — | **✓ (reliability diagram)** |
+| AI report templates | — | — | — | Chinese only | **✓ Chinese / English / Summary** |
 
 ---
 
@@ -28,9 +32,13 @@ Trained on **2,000 ClinVar missense variants** across **547 genes** (balanced 1:
 - **Genos scoring**: Human-centric genomic foundation model pathogenicity score [2]
 - **gnomAD AF**: Population allele frequency from gnomAD v4 (ACMG BA1/PM2 signal)
 - **Stacking ensemble**: XGBoost + LightGBM with logistic regression meta-learner
+- **Isotonic calibration** *(v5 new)*: Better probability calibration than Platt Scaling (Brier 0.0685 vs 0.0743)
+- **ACMG 5-tier badge** *(v5 new)*: Automatic P/LP/VUS/LB/B classification with confidence level
+- **Variant history** *(v5 new)*: Session-level query history with side-by-side SHAP comparison
+- **Reliability diagram** *(v5 new)*: Model calibration curve in Model Info panel
 - **Interpretability**: Per-variant SHAP feature contribution chart
-- **🤖 AI Clinical Report** *(new)*: Kimi LLM (Moonshot AI) synthesizes all tool outputs into a structured ACMG-style clinical interpretation report with evidence-level annotations (PP3/BP4/PM2/BA1), streaming output, and Markdown download
-- **Interactive UI**: Streamlit app with pathogenicity gauge, score bar chart, SHAP visualization, and AI report tab
+- **🤖 AI Clinical Report**: Kimi LLM (Moonshot AI) synthesizes all tool outputs into a structured ACMG-style clinical interpretation report — now with **Chinese / English / Summary** template selection
+- **Interactive UI**: Streamlit app with pathogenicity gauge, score bar chart, SHAP visualization, history tab, and AI report tab
 - **Reproducible**: Full training pipeline included (`train.py`)
 
 ---
@@ -40,16 +48,27 @@ Trained on **2,000 ClinVar missense variants** across **547 genes** (balanced 1:
 5-fold cross-validation on 2,000 ClinVar missense variants (expert panel reviewed, multi-gene).
 Bootstrap 95% confidence intervals (n=1,000 resamples).
 
-| Model | AUROC [95% CI] | AUPRC [95% CI] |
-|---|---|---|
-| **v4: + gnomAD v4 AF (8 features)** | **0.9664 [0.958–0.972]** | **0.9671 [0.956–0.973]** |
-| v3: + phyloP (7 features) | 0.9488 [0.938–0.958] | 0.9447 [0.933–0.955] |
-| v2: XGBoost + Evo2 + Genos | 0.9373 [0.927–0.947] | 0.9345 [0.921–0.946] |
-| AlphaMissense alone | 0.9109 [0.898–0.923] | 0.9393 [0.927–0.948] |
-| CADD alone | 0.9039 [0.886–0.916] | 0.9220 [0.903–0.938] |
-| Genos alone | 0.6478 [0.619–0.674] | 0.7231 [0.683–0.749] |
+| Model | AUROC [95% CI] | AUPRC [95% CI] | Brier |
+|---|---|---|---|
+| **v5: Isotonic calibration** | **0.9679** | **0.9643** | **0.0685** |
+| v4: Platt calibration | 0.9664 [0.958–0.972] | 0.9671 [0.956–0.973] | 0.0743 |
+| v3: + phyloP (7 features) | 0.9488 [0.938–0.958] | 0.9447 [0.933–0.955] | — |
+| v2: XGBoost + Evo2 + Genos | 0.9373 [0.927–0.947] | 0.9345 [0.921–0.946] | — |
+| AlphaMissense alone | 0.9109 [0.898–0.923] | 0.9393 [0.927–0.948] | — |
+| CADD alone | 0.9039 [0.886–0.916] | 0.9220 [0.903–0.938] | — |
+| Genos alone | 0.6478 [0.619–0.674] | 0.7231 [0.683–0.749] | — |
 
-> Adding gnomAD v4 AF to v3 improves AUROC by **+0.0176** — the largest single-feature gain in the project. gnomAD AF alone achieves AUROC = 0.96 on variants with coverage, capturing the ACMG BA1/PM2 population frequency signal orthogonal to all other features.
+**Independent holdout test (n=300, 150P/150B):**
+
+| Split | AUROC | AUPRC | F1 | Sensitivity | Specificity |
+|---|---|---|---|---|---|
+| 5-fold CV OOF | 0.9679 | 0.9643 | 0.9022 | — | — |
+| **Holdout test** | **0.9547** | **0.9527** | **0.8946** | **0.9333** | **0.8467** |
+
+> v5 switches from Platt Scaling to **Isotonic Regression** calibration, reducing Brier score from 0.0743 → 0.0685 (−7.8%) and ECE from 0.023 → ~0. The holdout AUROC gap (0.9679 → 0.9547) confirms no overfitting.
+
+![Calibration Comparison](figures/fig_calibration_comparison.png)
+![Holdout Validation](figures/fig_validation_holdout.png)
 
 ### ROC & Precision-Recall Curves
 
@@ -143,45 +162,39 @@ AlphaMissense remains the dominant contributor, followed by CADD and PolyPhen-2.
 
 ```
 SNV-judge/
-├── app.py                              # Streamlit web application (v4 + AI report)
-├── kimi_report.py                      # Kimi LLM clinical report generation module
+├── app.py                              # Streamlit web application (v5)
+├── kimi_report.py                      # Kimi LLM clinical report generation (Chinese/English/Summary)
 ├── train.py                            # Full training pipeline (data → model → evaluation)
 ├── requirements.txt                    # Python dependencies (includes openai>=1.0)
-├── SNV_judge_opening_defense_v2.pptx   # Opening defense presentation (16 slides, with Plan B demo & Plan C vision)
-├── xgb_model_v4.pkl                # Trained stacking classifier (v4, 8 features)
-├── platt_scaler_v4.pkl             # Platt calibration scaler (v4)
-├── train_medians_v4.pkl            # Training set medians (for NaN imputation, v4)
-├── feature_cols_v4.pkl             # Feature column names (v4)
-├── xgb_model_v3.pkl                # v3 model (7 features, kept for fallback)
-├── platt_scaler_v3.pkl             # v3 Platt scaler
-├── train_medians_v3.pkl            # v3 medians
-├── xgb_model_v2.pkl                # v2 model (6 features, kept for fallback)
-├── platt_scaler_v2.pkl             # v2 Platt scaler
-├── train_medians_v2.pkl            # v2 medians
+├── SNV_judge_opening_defense_v2.pptx   # Opening defense presentation
+├── xgb_model_v5.pkl                # Trained stacking classifier (v5, same 8 features as v4)
+├── platt_scaler_v5.pkl             # Isotonic Regression calibrator (v5) ← NEW
+├── train_medians_v5.pkl            # Training set medians (for NaN imputation, v5)
+├── feature_cols_v5.pkl             # Feature column names (v5)
+├── xgb_model_v4.pkl                # v4 model (fallback)
+├── platt_scaler_v4.pkl             # v4 Platt scaler (fallback)
+├── train_medians_v4.pkl            # v4 medians (fallback)
 ├── data/
 │   ├── feature_matrix_v4.xlsx      # Complete 2,000-variant feature matrix (all scores)
 │   ├── feature_matrix_v4.csv       # Same as above in CSV format
-│   ├── scoring_ckpt.pkl            # Pre-computed Evo2 LLR + Genos scores (1,677/2,000)
-│   ├── vep_scores.pkl              # Pre-computed VEP scores (SIFT/PP2/AM/CADD, 10,542 variants)
-│   ├── phylop_cache.pkl            # Pre-computed phyloP scores (1,922/2,000)
-│   ├── gnomad_af_cache.pkl         # Pre-computed gnomAD v4 AF (2,000 entries, 739 non-zero)
-│   ├── model_metrics_v4.csv        # v4 AUROC/AUPRC with bootstrap 95% CIs
-│   ├── model_metrics_v3.csv        # v3 metrics (legacy)
-│   └── model_metrics_v2.csv        # v2 metrics (legacy)
+│   ├── calibration_metrics_v5.csv  # Calibration comparison: Uncalibrated/Platt/Isotonic ← NEW
+│   ├── model_metrics_v5.csv        # v5 CV + holdout metrics ← NEW
+│   ├── model_metrics_v4.csv        # v4 metrics (legacy)
+│   ├── scoring_ckpt.pkl            # Pre-computed Evo2 LLR + Genos scores
+│   ├── vep_scores.pkl              # Pre-computed VEP scores
+│   ├── phylop_cache.pkl            # Pre-computed phyloP scores
+│   └── gnomad_af_cache.pkl         # Pre-computed gnomAD v4 AF
 └── figures/
-    ├── fig1_roc_comparison.png/svg      # ROC + PR curves — all versions vs baselines
-    ├── fig2_ablation.png/svg            # Ablation study — per-feature AUROC contribution
-    ├── fig3_data_distribution.png/svg   # Training set: label balance, chromosomes, top genes
-    ├── fig4_architecture.png/svg        # System architecture & data pipeline diagram
-    ├── figB1_agent_workflow.png/svg     # Agent pipeline diagram (5-stage, Plan B)
-    ├── figB2_report_demo.png/svg        # AI report demo: TP53 R175H vs BRCA2 N372H comparison
-    ├── figB3_plan_c_vision.png/svg      # Plan C multi-agent architecture vision (LangGraph)
-    ├── model_curves_v4.png/svg          # ROC + PR curves (v4 vs v3, legacy)
-    ├── shap_analysis_v4.png/svg         # SHAP beeswarm + bar plots (8 features)
-    ├── model_curves_v3.png/svg          # v3 curves (legacy)
-    ├── shap_analysis_v3.png/svg         # v3 SHAP (legacy)
-    ├── model_curves_v2.png/svg          # v2 curves (legacy)
-    └── shap_analysis_v2.png/svg         # v2 SHAP (legacy)
+    ├── fig_calibration_comparison.png/svg  # Reliability diagram: Platt vs Isotonic ← NEW
+    ├── fig_validation_holdout.png/svg      # Holdout test ROC/PR/CM (n=300) ← NEW
+    ├── fig1_roc_comparison.png/svg         # ROC + PR curves — all versions vs baselines
+    ├── fig2_ablation.png/svg               # Ablation study — per-feature AUROC contribution
+    ├── fig3_data_distribution.png/svg      # Training set distribution
+    ├── fig4_architecture.png/svg           # System architecture diagram
+    ├── figB1_agent_workflow.png/svg        # Agent pipeline diagram
+    ├── figB2_report_demo.png/svg           # AI report demo
+    ├── figB3_plan_c_vision.png/svg         # Plan C multi-agent vision
+    └── shap_analysis_v4.png/svg            # SHAP beeswarm + bar plots
 ```
 
 ---

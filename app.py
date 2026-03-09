@@ -1,14 +1,22 @@
 """
-SNV Pathogenicity Predictor — v4
+SNV Pathogenicity Predictor — v5
 =================================
-Ensemble meta-model (XGBoost + LightGBM Stacking, Platt-calibrated) integrating:
+Ensemble meta-model (XGBoost + LightGBM Stacking, Isotonic-calibrated) integrating:
   Classical:    SIFT · PolyPhen-2 · AlphaMissense · CADD
   Foundation:   Evo2-40B (NVIDIA NIM) · Genos-10B (Stomics)
   Conservation: phyloP (Ensembl VEP)
   Population:   gnomAD v4 allele frequency
 
 Trained on 2,000 ClinVar missense variants across 547 genes (5-fold CV).
-AUROC = 0.9664 [0.958–0.972]  |  AUPRC = 0.9671 [0.956–0.973]
+AUROC = 0.9679 [0.959–0.974]  |  AUPRC = 0.9643 [0.953–0.972]
+Holdout test (n=300): AUROC = 0.9547  |  F1 = 0.8946
+
+New in v5:
+  - Isotonic Regression calibration (Brier 0.0685 vs Platt 0.0743)
+  - ACMG 5-tier classification badge
+  - Variant query history with session-level comparison
+  - Model reliability diagram (calibration curve)
+  - AI report template selector (Chinese / English / Summary)
 
 Run:
   export EVO2_API_KEY="nvapi-..."    # optional — enables Evo2 scoring
@@ -67,21 +75,86 @@ BASE = Path(__file__).parent
 
 @st.cache_resource
 def load_artefacts():
-    """Load model artefacts: v4 → v3 → v2 → v1 fallback chain."""
-    for suffix, ver in [("_v4", "v4"), ("_v3", "v3"), ("_v2", "v2"), ("", "v1")]:
+    """Load model artefacts: v5 → v4 → v3 → v2 → v1 fallback chain.
+    v5 uses Isotonic Regression calibration (better Brier score than Platt).
+    """
+    for suffix, ver in [("_v5", "v5"), ("_v4", "v4"), ("_v3", "v3"), ("_v2", "v2"), ("", "v1")]:
         try:
             with open(BASE / f"xgb_model{suffix}.pkl", "rb") as f:
                 model = pickle.load(f)
             with open(BASE / f"train_medians{suffix}.pkl", "rb") as f:
                 medians = pickle.load(f)
             with open(BASE / f"platt_scaler{suffix}.pkl", "rb") as f:
-                platt = pickle.load(f)
-            return model, medians, platt, ver
+                calibrator = pickle.load(f)
+            return model, medians, calibrator, ver
         except FileNotFoundError:
             continue
     raise RuntimeError("No model artefacts found. Run train.py first.")
 
 MODEL, MEDIANS, PLATT, MODEL_VER = load_artefacts()
+
+# ── ACMG 5-tier classification ────────────────────────────────────────────
+# Thresholds calibrated on ClinVar gold-standard variants
+ACMG_TIERS = [
+    # (min_prob, label, short, color, text_color, confidence)
+    (0.90, "Pathogenic",        "P",  "#c0392b", "#ffffff", "High confidence"),
+    (0.70, "Likely Pathogenic", "LP", "#e74c3c", "#ffffff", "Moderate confidence"),
+    (0.40, "VUS",               "VUS","#e67e22", "#ffffff", "Uncertain significance"),
+    (0.20, "Likely Benign",     "LB", "#27ae60", "#ffffff", "Moderate confidence"),
+    (0.00, "Benign",            "B",  "#1a7a4a", "#ffffff", "High confidence"),
+]
+
+def get_acmg_tier(prob: float) -> dict:
+    """Return ACMG tier dict for a given calibrated probability."""
+    for min_p, label, short, color, text_color, confidence in ACMG_TIERS:
+        if prob >= min_p:
+            return {"label": label, "short": short, "color": color,
+                    "text_color": text_color, "confidence": confidence,
+                    "prob": prob}
+    return get_acmg_tier(0.0)
+
+def render_acmg_badge(prob: float) -> str:
+    """Return HTML for an ACMG classification badge."""
+    t = get_acmg_tier(prob)
+    return (
+        f'<span style="background-color:{t["color"]};color:{t["text_color"]};'
+        f'padding:4px 12px;border-radius:12px;font-weight:bold;font-size:14px;'
+        f'letter-spacing:0.5px;">'
+        f'{t["label"]} ({t["short"]})</span>'
+        f'&nbsp;<span style="color:#666;font-size:12px;">{t["confidence"]} · '
+        f'{prob:.1%}</span>'
+    )
+
+# ── Variant history (session-level) ──────────────────────────────────────
+if "variant_history" not in st.session_state:
+    st.session_state["variant_history"] = []   # list of result dicts
+
+def _add_to_history(chrom, pos, ref, alt, scores, cal_prob, shap_vals,
+                    evo2_llr, genos_path, gnomad_log_af):
+    """Append a query result to session history (max 20 entries)."""
+    import datetime
+    entry = {
+        "time":     datetime.datetime.now().strftime("%H:%M:%S"),
+        "variant":  f"chr{chrom}:{pos} {ref}>{alt}",
+        "gene":     scores.get("gene", "—"),
+        "hgvsp":    scores.get("hgvsp", "—"),
+        "prob":     round(cal_prob, 4),
+        "acmg":     get_acmg_tier(cal_prob)["label"],
+        "shap":     list(shap_vals),
+        "scores":   {k: scores.get(k) for k in
+                     ["sift_score", "polyphen_score", "am_pathogenicity",
+                      "cadd_phred", "phylop"]},
+        "evo2_llr":      evo2_llr,
+        "genos_path":    genos_path,
+        "gnomad_log_af": gnomad_log_af,
+    }
+    history = st.session_state["variant_history"]
+    # Avoid exact duplicates
+    if not history or history[-1]["variant"] != entry["variant"]:
+        history.append(entry)
+        if len(history) > 20:
+            history.pop(0)
+    st.session_state["variant_history"] = history
 
 # ── VEP API ───────────────────────────────────────────────────────────────
 VEP_URL = "https://rest.ensembl.org/vep/homo_sapiens/region"
@@ -362,8 +435,13 @@ def predict(scores: dict, evo2_llr: float = np.nan,
     else:
         raw_prob = float(MODEL.predict_proba(X)[0, 1])
 
-    logit_raw = np.log(raw_prob / (1 - raw_prob + 1e-9))
-    cal_prob  = float(PLATT.predict_proba([[logit_raw]])[0, 1])
+    # Calibration: Isotonic (v5) uses predict() directly; Platt uses predict_proba on logit
+    from sklearn.isotonic import IsotonicRegression
+    if isinstance(PLATT, IsotonicRegression):
+        cal_prob = float(np.clip(PLATT.predict([raw_prob])[0], 0.0, 1.0))
+    else:
+        logit_raw = np.log(raw_prob / (1 - raw_prob + 1e-9))
+        cal_prob  = float(PLATT.predict_proba([[logit_raw]])[0, 1])
 
     # SHAP via TreeExplainer on XGB base model
     try:
@@ -627,14 +705,53 @@ st.markdown(
     "+ **Evo2-40B** (NVIDIA NIM) + **Genos-10B** (Stomics) + **phyloP** (conservation) "
     "+ **gnomAD v4 AF** (population frequency).  \n"
     "Trained on 2,000 ClinVar missense variants across 547 genes · "
-    "AUROC = 0.9664 [0.958–0.972]"
+    "AUROC = 0.9679 · Holdout AUROC = 0.9547 · Isotonic calibration (Brier = 0.0685)"
 )
+
+# ── Model Info expander with reliability diagram ──────────────────────────
+with st.expander("📊 Model Info & Calibration Curve", expanded=False):
+    _cal_fig_path = BASE / "figures" / "fig_calibration_comparison.png"
+    _val_fig_path = BASE / "figures" / "fig_validation_holdout.png"
+    _info_col1, _info_col2 = st.columns(2)
+    with _info_col1:
+        st.markdown("**Performance Summary**")
+        st.markdown("""
+| Split | AUROC | AUPRC | F1 | Brier |
+|---|---|---|---|---|
+| 5-fold CV (n=2000) | 0.9679 | 0.9643 | 0.9022 | 0.0685 |
+| Holdout test (n=300) | 0.9547 | 0.9527 | 0.8946 | 0.0789 |
+
+**Calibration** (v5 vs v4):
+| Method | Brier | ECE |
+|---|---|---|
+| Uncalibrated | 0.0807 | 0.0639 |
+| Platt Scaling (v4) | 0.0743 | 0.0233 |
+| **Isotonic Reg. (v5)** | **0.0685** | **~0** |
+
+**ACMG Thresholds**:
+- ≥ 0.90 → Pathogenic (P)
+- 0.70–0.90 → Likely Pathogenic (LP)
+- 0.40–0.70 → VUS
+- 0.20–0.40 → Likely Benign (LB)
+- < 0.20 → Benign (B)
+        """)
+    with _info_col2:
+        if _cal_fig_path.exists():
+            st.image(str(_cal_fig_path), caption="Reliability Diagram — Calibration Comparison",
+                     use_container_width=True)
+        else:
+            st.info("Calibration figure not found. Run train.py to generate.")
+    if _val_fig_path.exists():
+        st.image(str(_val_fig_path), caption="Independent Holdout Validation (n=300)",
+                 use_container_width=True)
+
 st.divider()
 
-# ── Tabs: Single variant | Batch VCF | AI Report ──────────────────────────
-tab_single, tab_batch, tab_report = st.tabs([
+# ── Tabs: Single variant | Batch VCF | History | AI Report ───────────────
+tab_single, tab_batch, tab_history, tab_report = st.tabs([
     "🔬 Single Variant",
     "📂 Batch VCF",
+    "📋 History",
     "🤖 AI Clinical Report",
 ])
 
@@ -693,20 +810,27 @@ with tab_single:
 
         raw_prob, cal_prob, shap_vals = predict(scores, evo2_llr, genos_path, gnomad_log_af)
 
+        # ── Record to history ─────────────────────────────────────────────
+        _add_to_history(chrom_clean, int(pos), ref, alt, scores, cal_prob,
+                        shap_vals, evo2_llr, genos_path, gnomad_log_af)
+
         col1, col2, col3 = st.columns([1.2, 1.1, 1.1])
 
         with col1:
             st.subheader("Pathogenicity Score")
+            # ACMG 5-tier badge
+            st.markdown(render_acmg_badge(cal_prob), unsafe_allow_html=True)
+            st.markdown("")
             st.pyplot(make_gauge(cal_prob), use_container_width=True)
-            _ai_used = MODEL_VER in ("v2", "v3") and not (np.isnan(evo2_llr) and np.isnan(genos_path))
-            _ver_desc = {"v4": "v4 model (Evo2 + Genos + phyloP + gnomAD AF)",
+            _cal_method = "Isotonic-calibrated" if MODEL_VER == "v5" else "Platt-calibrated"
+            _ver_desc = {"v5": "v5 model (Isotonic cal.)",
+                         "v4": "v4 model (Evo2 + Genos + phyloP + gnomAD AF)",
                          "v3": "v3 model (Evo2 + Genos + phyloP)",
                          "v2": "v2 model (Evo2 + Genos)",
                          "v1": "base 4-feature model"}
             st.caption(
-                f"Platt-calibrated probability (raw XGBoost: {raw_prob:.1%}).  \n"
-                + (f"Using {_ver_desc.get(MODEL_VER, MODEL_VER)}."
-                   if _ai_used else "AI scores unavailable — using base 4-feature model.")
+                f"{_cal_method} probability (raw: {raw_prob:.1%}).  \n"
+                f"Using {_ver_desc.get(MODEL_VER, MODEL_VER)}."
             )
             st.markdown("**Variant annotation**")
             for k, v in {
@@ -764,6 +888,7 @@ with tab_single:
                         for chunk in _kimi_mod.generate_report_stream(
                             variant_info, scores, shap_vals, cal_prob,
                             evo2_llr, genos_path, gnomad_log_af, MODEL_VER,
+                            template="chinese",
                         ):
                             full_report += chunk
                             report_placeholder.markdown(full_report + "▌")
@@ -821,13 +946,16 @@ with tab_single:
 4. **Stacking ensemble**: XGBoost + LightGBM meta-model combines all features
 5. **SHAP**: Explains which features drove the prediction
 
-### Model performance (v4, 5-fold CV, n=2,000)
-| Model | AUROC [95% CI] | AUPRC [95% CI] |
-|---|---|---|
-| **v4 (+ gnomAD AF)** | **0.9664 [0.958–0.972]** | **0.9671 [0.956–0.973]** |
-| v3 (+ phyloP) | 0.9488 [0.938–0.958] | 0.9447 [0.933–0.955] |
-| v2 (Evo2 + Genos) | 0.9373 [0.927–0.947] | 0.9345 [0.921–0.946] |
-| AlphaMissense alone | 0.9109 [0.898–0.923] | 0.9393 [0.927–0.948] |
+### Model performance (v5, 5-fold CV + holdout, n=2,000)
+| Model | AUROC | AUPRC | Calibration |
+|---|---|---|---|
+| **v5 (Isotonic cal.)** | **0.9679** | **0.9643** | **Brier=0.0685** |
+| v4 (Platt cal.) | 0.9664 | 0.9671 | Brier=0.0743 |
+| v3 (+ phyloP) | 0.9488 | 0.9447 | — |
+| v2 (Evo2 + Genos) | 0.9373 | 0.9345 | — |
+| AlphaMissense alone | 0.9109 | 0.9393 | — |
+
+**Holdout test (n=300)**: AUROC=0.9547 · AUPRC=0.9527 · F1=0.8946
 
 ### API key setup
 ```bash
@@ -979,7 +1107,133 @@ with tab_batch:
         """)
 
 # ════════════════════════════════════════════════════════════════════════
-# TAB 3: AI Clinical Report
+# TAB 3: Variant History
+# ════════════════════════════════════════════════════════════════════════
+with tab_history:
+    st.subheader("📋 Variant Query History")
+    history = st.session_state.get("variant_history", [])
+
+    if not history:
+        st.info("No variants queried yet in this session. "
+                "Run a prediction in the **Single Variant** tab to start building history.")
+    else:
+        import pandas as pd
+
+        # ── Summary table ─────────────────────────────────────────────
+        hist_df = pd.DataFrame([{
+            "Time":    h["time"],
+            "Variant": h["variant"],
+            "Gene":    h["gene"],
+            "HGVSp":   h["hgvsp"],
+            "Prob":    h["prob"],
+            "ACMG":    h["acmg"],
+        } for h in history])
+
+        def _color_acmg(val):
+            colors = {
+                "Pathogenic":        "background-color:#fde8e8;color:#c0392b",
+                "Likely Pathogenic": "background-color:#fef0f0;color:#e74c3c",
+                "VUS":               "background-color:#fef9e7;color:#d68910",
+                "Likely Benign":     "background-color:#eafaf1;color:#27ae60",
+                "Benign":            "background-color:#d5f5e3;color:#1a7a4a",
+            }
+            return colors.get(val, "")
+
+        st.dataframe(
+            hist_df.style
+                .applymap(_color_acmg, subset=["ACMG"])
+                .format({"Prob": "{:.4f}"}),
+            use_container_width=True,
+            height=min(400, 60 + 35 * len(hist_df)),
+        )
+
+        # ── Export history ────────────────────────────────────────────
+        csv_hist = hist_df.to_csv(index=False)
+        st.download_button(
+            "⬇️ Export history as CSV",
+            data=csv_hist,
+            file_name="snv_judge_history.csv",
+            mime="text/csv",
+        )
+
+        st.divider()
+
+        # ── Comparison view ───────────────────────────────────────────
+        if len(history) >= 2:
+            st.markdown("#### Compare Two Variants")
+            variant_labels = [f"{h['time']} — {h['variant']} ({h['gene']})"
+                              for h in history]
+            col_a, col_b = st.columns(2)
+            with col_a:
+                sel_a = st.selectbox("Variant A", variant_labels,
+                                     index=len(variant_labels)-2, key="hist_a")
+            with col_b:
+                sel_b = st.selectbox("Variant B", variant_labels,
+                                     index=len(variant_labels)-1, key="hist_b")
+
+            idx_a = variant_labels.index(sel_a)
+            idx_b = variant_labels.index(sel_b)
+            ha, hb = history[idx_a], history[idx_b]
+
+            # Side-by-side comparison
+            c1, c2 = st.columns(2)
+            for col, h in [(c1, ha), (c2, hb)]:
+                with col:
+                    st.markdown(f"**{h['variant']}**")
+                    st.markdown(render_acmg_badge(h["prob"]), unsafe_allow_html=True)
+                    st.markdown("")
+                    st.markdown(f"- Gene: **{h['gene']}**")
+                    st.markdown(f"- HGVSp: `{h['hgvsp']}`")
+                    st.markdown(f"- Probability: **{h['prob']:.4f}**")
+                    st.markdown(f"- ACMG: **{h['acmg']}**")
+                    # Mini score table
+                    score_rows = []
+                    for feat, key in [("SIFT (inv)", "sift_score"),
+                                      ("PolyPhen-2", "polyphen_score"),
+                                      ("AlphaMissense", "am_pathogenicity"),
+                                      ("CADD Phred", "cadd_phred"),
+                                      ("phyloP", "phylop")]:
+                        v = h["scores"].get(key)
+                        score_rows.append({"Feature": feat,
+                                           "Value": f"{v:.3f}" if v is not None else "N/A"})
+                    score_rows.append({"Feature": "Evo2 LLR",
+                                       "Value": f"{h['evo2_llr']:.3f}"
+                                                if h["evo2_llr"] is not None
+                                                   and not (isinstance(h["evo2_llr"], float)
+                                                            and np.isnan(h["evo2_llr"]))
+                                                else "N/A"})
+                    st.dataframe(pd.DataFrame(score_rows), use_container_width=True,
+                                 hide_index=True)
+
+            # SHAP comparison bar chart
+            st.markdown("#### SHAP Contribution Comparison")
+            feat_labels_hist = FEATURE_LABELS[:len(ha["shap"])]
+            fig_cmp, axes_cmp = plt.subplots(1, 2, figsize=(10, 4), sharey=True)
+            for ax_c, h, title_c in [(axes_cmp[0], ha, sel_a.split("—")[1].strip()),
+                                      (axes_cmp[1], hb, sel_b.split("—")[1].strip())]:
+                shap_c = h["shap"][:len(feat_labels_hist)]
+                order_c = np.argsort(np.abs(shap_c))
+                labs_c  = [feat_labels_hist[i] for i in order_c]
+                vals_c  = [shap_c[i] for i in order_c]
+                cols_c  = ["#D55E00" if v > 0 else "#0072B2" for v in vals_c]
+                ax_c.barh(labs_c, vals_c, color=cols_c, height=0.55, edgecolor="white")
+                ax_c.axvline(0, color="black", lw=0.8)
+                ax_c.set_title(title_c[:40], fontsize=10, fontweight="bold")
+                ax_c.set_xlabel("SHAP value", fontsize=9)
+                ax_c.grid(True, alpha=0.2, axis="x")
+            plt.tight_layout()
+            st.pyplot(fig_cmp, use_container_width=True)
+            plt.close(fig_cmp)
+        else:
+            st.info("Query at least 2 variants to enable comparison.")
+
+        st.divider()
+        if st.button("🗑️ Clear History", type="secondary"):
+            st.session_state["variant_history"] = []
+            st.rerun()
+
+# ════════════════════════════════════════════════════════════════════════
+# TAB 4: AI Clinical Report
 # ════════════════════════════════════════════════════════════════════════
 with tab_report:
     st.subheader("🤖 AI 智能临床变异解读报告")
@@ -1046,12 +1300,28 @@ with tab_report:
         )
 
     with col_right:
-        st.markdown("#### 报告说明")
+        st.markdown("#### 报告模板")
+        report_template = st.radio(
+            "选择报告语言/格式",
+            options=["🇨🇳 中文临床报告", "🇬🇧 English Clinical Report", "📝 简版摘要"],
+            index=0,
+            key="report_template",
+            help="中文报告适合国内临床遗传咨询；英文报告适合国际发表；简版摘要适合快速浏览。",
+        )
+        st.session_state["selected_template"] = report_template
+
+        template_desc = {
+            "🇨🇳 中文临床报告": "完整 ACMG 风格中文报告，含六节结构化内容",
+            "🇬🇧 English Clinical Report": "Full ACMG-style report in English, 6-section structure",
+            "📝 简版摘要": "3-5 句话的快速摘要，含分类结论和主要证据",
+        }
+        st.caption(template_desc.get(report_template, ""))
+        st.markdown("---")
         st.markdown("""
 **报告包含以下内容：**
 
 1. **变异基本信息** — 坐标、基因、蛋白变化
-2. **集成预测结果** — SNV-judge v4 校准概率
+2. **集成预测结果** — SNV-judge v5 校准概率 + ACMG 分类
 3. **多维度证据分析**
    - 经典工具（SIFT/PP2/AM/CADD）→ PP3/BP4
    - 基因组基础模型（Evo2/Genos）
@@ -1119,10 +1389,17 @@ with tab_report:
             report_area = st.empty()
             full_report = ""
             try:
+                _tmpl = st.session_state.get("selected_template", "🇨🇳 中文临床报告")
+                _tmpl_map = {
+                    "🇨🇳 中文临床报告":          "chinese",
+                    "🇬🇧 English Clinical Report": "english",
+                    "📝 简版摘要":                 "summary",
+                }
                 with st.spinner("Kimi 正在分析多源证据，生成临床解读报告…"):
                     for chunk in _kimi_mod.generate_report_stream(
                         v_info, v_scores, v_shap, v_prob,
                         v_evo2, v_genos, v_gnomad, v_model_ver,
+                        template=_tmpl_map.get(_tmpl, "chinese"),
                     ):
                         full_report += chunk
                         report_area.markdown(full_report + "▌")
