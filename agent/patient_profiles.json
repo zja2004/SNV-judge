@@ -1,0 +1,18 @@
+{
+  "P001": {
+    "patient_id": "P001",
+    "variants": [
+      {
+        "variant": "17:7674220:C:T",
+        "gene": "TP53",
+        "hgvsp": "R175H",
+        "acmg": "P",
+        "probability": 0.969,
+        "notes": "Li4综合征家系先证者",
+        "saved_at": "2026-03-09 10:15:51"
+      }
+    ],
+    "created_at": "2026-03-09 10:15:51",
+    "last_updated": "2026-03-09 10:15:51"
+  }
+}
