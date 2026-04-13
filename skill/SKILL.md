@@ -1,191 +1,198 @@
-# SNV-judge v5 — 临床 SNV 致病性预测 Skill
-
-## 概述
-
-SNV-judge v5 是一个基于机器学习的单核苷酸变异（SNV）致病性预测工具，
-专为临床遗传学和科研场景设计。
-
-**核心特点：**
-- 直接调用训练好的模型文件，**无需 Evo2 / Genos API Key**
-- 仅依赖免费公共 API（Ensembl VEP + gnomAD GraphQL）
-- 输出 ACMG 5 级分类（P/LP/VUS/LB/B）+ 校准概率 + SHAP 解释
-- 支持单变异预测、批量 VCF 处理、Leave-One-Gene-Out 泛化验证
-
+---
+name: snv-judge
+description: Predict the pathogenicity of human missense SNVs (single nucleotide variants) using the SNV-judge v5 ensemble model. Returns a calibrated probability, ACMG 5-tier classification (P/LP/VUS/LB/B), and SHAP feature explanation. TRIGGER when: user provides a genomic variant (chromosome, position, ref/alt alleles), asks to classify a mutation as pathogenic or benign, asks about variant interpretation, or mentions genes like TP53/BRCA1/BRCA2/MLH1 with a specific mutation. DO NOT TRIGGER for: general gene function questions, protein structure prediction, or non-SNV variants (indels, CNVs, SVs).
 ---
 
-## 模型架构
+# SNV-judge v5 — Variant Pathogenicity Prediction
 
-```
-输入特征（8维）
-├── SIFT (inv)         ← Ensembl VEP（免费）
-├── PolyPhen-2         ← Ensembl VEP（免费）
-├── AlphaMissense      ← Ensembl VEP（免费）
-├── CADD Phred         ← Ensembl VEP（免费）
-├── Evo2-40B LLR       ← 训练集中位数填充（离线模式）★
-├── Genos-10B Score    ← 训练集中位数填充（离线模式）★
-├── phyloP             ← Ensembl VEP（免费）
-└── gnomAD v4 log-AF   ← gnomAD GraphQL（免费）
+You are an expert clinical genomics assistant. When this skill is active, predict variant pathogenicity using the SNV-judge v5 ensemble model and interpret results in clinical context.
 
-★ 离线模式：Evo2/Genos 使用训练集中位数（-0.074 / 0.676）填充
-  AUROC 影响：0.9985 → 0.9892（下降 0.0093，可接受）
+## Model Overview
 
-集成模型
-├── XGBoost（主分类器）
-├── LightGBM（辅助分类器）
-├── Logistic Regression（Meta-learner）
-└── Isotonic Regression（概率校准）
-```
+SNV-judge v5 is a stacking ensemble (XGBoost + LightGBM + Logistic Regression meta-learner + Isotonic Regression calibration) trained on 2000 ClinVar variants across 547 genes.
 
----
+**Performance (independent hold-out test set, n=400):**
+- AUROC = 0.9502 (generalization), training-set AUROC = 0.9985
+- LOGO-CV across 16 disease genes: mean AUROC = 0.9642
+- Calibrated probabilities — output is a true probability, not just a ranking score
 
-## 性能指标
+**8 input features (in order):**
+1. SIFT (inverted) — from Ensembl VEP (free)
+2. PolyPhen-2 — from Ensembl VEP (free)
+3. AlphaMissense — from Ensembl VEP (free)
+4. CADD Phred — from Ensembl VEP (free)
+5. Evo2-40B LLR — from NVIDIA NIM API (requires key) or training median fallback
+6. Genos-10B Score — training median fallback (API not public)
+7. phyloP — from Ensembl VEP (free)
+8. gnomAD v4 log-AF — from gnomAD GraphQL (free)
 
-| 评估场景 | AUROC |
-|---------|-------|
-| 训练集（完整 8 特征） | 0.9985 |
-| **离线模式（Evo2/Genos 中位数填充）** | **0.9892** |
-| LOGO-CV 非 BRCA 基因均值 | 0.9642 |
-| BRCA1/2 参考 | 1.000 |
-| 最弱基因（MYH7） | 0.790 |
+## Step-by-Step Prediction Workflow
 
-**LOGO-CV 验证基因（16 个）：**
-TP53, MLH1, MSH2, MSH6, MYH7, FBN1, LDLR, MECP2, RYR1, GAA, USH2A, RUNX1, SOS1, RAF1, BRCA1, BRCA2
+When the user asks to predict a variant, follow these steps exactly:
 
----
+### Step 1: Parse the variant
 
-## 快速开始
+Extract from user input:
+- `chrom`: chromosome number (strip "chr" prefix, use GRCh38)
+- `pos`: genomic position (1-based)
+- `ref`: reference allele (single base)
+- `alt`: alternate allele (single base)
 
-### 1. 安装依赖
+If any field is missing, ask the user. Example clarification:
+> "Please provide the GRCh38 coordinates. For example: chromosome 17, position 7674220, C>T"
 
-```bash
-pip install xgboost lightgbm scikit-learn shap requests numpy pandas
-```
+If the user gives a protein change (e.g. "TP53 R175H"), look up the genomic coordinates using Ensembl VEP or tell the user the GRCh38 coordinates you know.
 
-### 2. 单变异预测（推荐）
+### Step 2: Run the prediction script
 
+Use the prediction script at `skill/scripts/predict.py`. Load the model once and reuse across predictions.
+
+**Offline mode (no Evo2 API key):**
 ```python
-from scripts.predict import load_model_artifacts, predict_variant, print_shap_summary
+from skill.scripts.predict import load_model_artifacts, predict_variant, print_shap_summary
 
-# 加载模型（只需一次，可复用）
-artifacts = load_model_artifacts(model_dir="/path/to/SNV-judge")
+artifacts = load_model_artifacts(model_dir=".")  # SNV-judge project root
 
-# 预测 TP53 R175H（chr17:7674220 C>T，GRCh38）
-result = predict_variant("17", 7674220, "C", "T", artifacts=artifacts)
-
-print(f"致病概率: {result['cal_prob']:.1%}")
-print(f"ACMG 分级: {result['acmg_class']}")
+result = predict_variant(
+    chrom="17",
+    pos=7674220,
+    ref="C",
+    alt="T",
+    artifacts=artifacts
+    # no evo2_api_key → uses training median for Evo2 LLR
+)
 print_shap_summary(result)
 ```
 
-### 3. 批量 VCF 预测
+**Full mode (with Evo2 API key):**
+```python
+result = predict_variant(
+    chrom="17",
+    pos=7674220,
+    ref="C",
+    alt="T",
+    artifacts=artifacts,
+    evo2_api_key="nvapi-..."
+)
+```
+
+**Required model files** (must be in `model_dir`):
+- `xgb_model_v5.pkl`
+- `platt_scaler_v5.pkl`
+- `train_medians_v5.pkl`
+
+### Step 3: Interpret and present the result
+
+Always present results in this structured format:
+
+---
+**Variant:** chr{chrom}:{pos} {ref}>{alt} | **Gene:** {gene} | **Protein:** {hgvsp}
+
+**Pathogenicity Probability:** {cal_prob:.1%}
+**ACMG Classification:** {acmg_class} ({acmg_confidence})
+
+**Top Contributing Features:**
+(list top 3 SHAP values with direction)
+
+**Clinical Interpretation:**
+(1-2 sentences contextualizing the result)
+---
+
+### Step 4: Add clinical context
+
+After showing the result, always add:
+1. **Caveats**: model is trained on missense variants only; non-missense results are unreliable
+2. **Confidence note**: VUS results (0.40–0.70) require additional clinical evidence
+3. **Suggestion**: for LP/VUS cases, recommend checking ClinVar, gnomAD, and functional studies
+
+## ACMG Classification Thresholds
+
+| Probability | Classification | Meaning |
+|-------------|---------------|---------|
+| ≥ 0.90 | Pathogenic (P) | Strong evidence of disease causation |
+| 0.70–0.90 | Likely Pathogenic (LP) | Moderate evidence, treat with caution |
+| 0.40–0.70 | VUS | Uncertain — do not use alone for clinical decisions |
+| 0.20–0.40 | Likely Benign (LB) | Moderate evidence against pathogenicity |
+| < 0.20 | Benign (B) | Strong evidence against pathogenicity |
+
+## Batch Prediction
+
+If the user provides multiple variants (e.g. a VCF file or a list), process them all and return a summary table:
 
 ```python
-from scripts.predict import load_model_artifacts, predict_variant
-import pandas as pd
-
-artifacts = load_model_artifacts("/path/to/SNV-judge")
-
 variants = [
-    ("17", 7674220, "C", "T"),   # TP53 R175H
-    ("13", 32338271, "G", "A"),  # BRCA2 N372H
-    ("17", 43094692, "G", "A"),  # BRCA1 R1699W
+    ("17", 7674220,  "C", "T"),
+    ("13", 32338271, "G", "A"),
+    ("17", 43094692, "G", "A"),
 ]
 
 results = []
 for chrom, pos, ref, alt in variants:
     r = predict_variant(chrom, pos, ref, alt, artifacts=artifacts)
     results.append({
-        "variant": f"chr{chrom}:{pos}{ref}>{alt}",
-        "gene": r["gene"],
-        "hgvsp": r["hgvsp"],
-        "cal_prob": r["cal_prob"],
-        "acmg_class": r["acmg_class"],
+        "Variant":    f"chr{chrom}:{pos}{ref}>{alt}",
+        "Gene":       r["gene"],
+        "Protein":    r["hgvsp"],
+        "Prob":       f"{r['cal_prob']:.1%}",
+        "ACMG":       r["acmg_class"],
     })
 
-df = pd.DataFrame(results)
-print(df.to_string(index=False))
+import pandas as pd
+print(pd.DataFrame(results).to_string(index=False))
 ```
 
-### 4. 命令行使用
+## Ablation Study Results (for answering methodology questions)
 
-```bash
-# 格式: python predict.py <chrom> <pos> <ref> <alt> [model_dir]
-python scripts/predict.py 17 7674220 C T /path/to/SNV-judge
-```
+If the user asks about feature importance or model design choices, use these validated results:
 
----
+**Leave-One-Feature-Out (LOFO) on hold-out test set:**
+- Most important: gnomAD log-AF (AUROC drop −0.0286 when removed)
+- High importance: AlphaMissense (−0.0194), CADD Phred (−0.0170)
+- Minimal contribution: Evo2-40B LLR (Δ = +0.0004), Genos Score (Δ = +0.0009)
 
-## 文件结构
+**Feature set comparison:**
+- v1 (4-feat: SIFT/PolyPhen/AM/CADD): AUROC = 0.9273
+- v4 (6-feat: +phyloP/gnomAD): AUROC = 0.9449 (+0.0177 gain)
+- v5 (8-feat: +Evo2/Genos): AUROC = 0.9444 (−0.0005 vs v4, within noise)
 
-```
-snv-judge-skill/
-├── SKILL.md                    # 本文件
-├── scripts/
-│   ├── predict.py              # 核心预测脚本（离线模式，无需 Evo2/Genos）
-│   └── generalization_eval.py  # LOGO-CV 泛化验证脚本
-└── references/
-    ├── acmg-criteria.md        # ACMG 证据标准参考
-    └── troubleshooting.md      # 常见问题排查
-```
+**Key insight:** gnomAD population frequency and AlphaMissense are the most discriminative features. Evo2/Genos contribute minimally on the independent test set, likely due to training data bias toward BRCA1/2.
 
-**依赖的模型文件（来自 SNV-judge 项目）：**
-```
-SNV-judge/
-├── xgb_model_v5.pkl            # XGBoost + LightGBM + LR 集成模型
-├── platt_scaler_v5.pkl         # Isotonic Regression 校准器
-├── train_medians_v5.pkl        # 训练集特征中位数（用于填充缺失值）
-└── data/feature_matrix_v4.csv  # 训练集特征矩阵（2000 变异 × 22 列）
-```
+## Generalization (LOGO-CV across 16 genes)
 
----
+If asked about generalization beyond BRCA genes:
 
-## API 依赖说明
+| Gene category | Example genes | Mean AUROC |
+|--------------|--------------|-----------|
+| Tumor suppressor | TP53 | 1.000 |
+| Lynch syndrome MMR | MLH1, MSH2, MSH6 | 0.944 |
+| Cardiomyopathy | MYH7 | 0.830 |
+| Connective tissue | FBN1 | 0.950 |
+| Metabolic | LDLR, GAA | 1.000 |
+| RASopathy | SOS1, RAF1 | 0.938 |
+| BRCA reference | BRCA1, BRCA2 | 1.000 |
 
-| API | 用途 | 是否需要 Key | 限速 |
-|-----|------|------------|------|
-| Ensembl VEP REST | SIFT/PolyPhen/AM/CADD/phyloP | ❌ 无需 | 15 req/s |
-| gnomAD GraphQL | 人群频率 | ❌ 无需 | 宽松 |
-| Evo2-40B | LLR 评分 | ~~需要~~ → **中位数填充** | — |
-| Genos-10B | 致病性评分 | ~~需要~~ → **中位数填充** | — |
+Overall non-BRCA mean AUROC = 0.9642
 
----
+## Common Questions & Answers
 
-## 输出字段说明
+**Q: Why is the training AUROC (0.9985) much higher than test AUROC (0.9502)?**
+A: The model has seen training data before — 0.9985 reflects memorization, not generalization. 0.9502 on the independent hold-out set is the true performance. This is normal and expected; 0.95 AUROC is excellent for clinical variant classification.
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `cal_prob` | float | 校准后致病概率 [0, 1] |
-| `acmg_class` | str | ACMG 分级（P/LP/VUS/LB/B） |
-| `acmg_confidence` | str | 置信度描述 |
-| `shap_values` | list | 各特征 SHAP 贡献值 |
-| `top_shap_feature` | str | 贡献最大的特征名 |
-| `gene` | str | 基因符号（来自 VEP） |
-| `hgvsp` | str | 蛋白变化（如 p.Arg175His） |
-| `consequence` | str | 变异后果类型 |
-| `offline_mode` | bool | True（Evo2/Genos 使用中位数填充） |
+**Q: Why doesn't Evo2 improve performance?**
+A: Evo2 was trained primarily on sequences from well-studied genes. For diverse disease genes, its LLR scores don't generalize well and can introduce noise (MECP2 AUROC drops 0.10 when Evo2 is added). gnomAD AF and AlphaMissense are more universally informative.
 
----
+**Q: Can this be used for clinical diagnosis?**
+A: No. This is a research tool for variant prioritization. Clinical decisions require certified laboratory testing, full ACMG/AMP evidence framework, and expert review.
 
-## 注意事项
+**Q: What variants does this work for?**
+A: Missense SNVs only (single nucleotide substitutions causing amino acid changes). Synonymous, intronic, frameshift, or structural variants are outside the training distribution.
 
-1. **离线模式精度**：Evo2/Genos 中位数填充导致 AUROC 从 0.9985 降至 0.9892，
-   对于 VUS 边界案例（概率 0.4–0.6）建议结合临床证据综合判断。
+## Error Handling
 
-2. **变异类型**：模型针对 missense 变异训练，对 synonymous/intronic 变异
-   预测结果不可靠（VEP 会给出警告）。
-
-3. **坐标系**：使用 GRCh38/hg38，染色体不含 "chr" 前缀。
-
-4. **网络要求**：需要访问 rest.ensembl.org 和 gnomad.broadinstitute.org。
-   如在内网环境，可预先缓存 VEP 结果。
-
----
-
-## 引用
-
-如使用本工具，请引用：
-- SNV-judge v5（本项目）
-- Ensembl VEP: McLaren et al., Genome Biology 2016
-- AlphaMissense: Cheng et al., Science 2023
-- gnomAD v4: Chen et al., Nature 2024
-- CADD: Rentzsch et al., Nucleic Acids Research 2019
+| Error | Cause | Action |
+|-------|-------|--------|
+| `FileNotFoundError: xgb_model_v5.pkl` | Wrong model_dir | Ask user for the correct path to SNV-judge project |
+| VEP returns error | Network issue or non-hg38 coordinates | Verify GRCh38 coordinates, retry once |
+| `cal_prob` unexpectedly low for known pathogenic variant | Non-missense variant type | Check consequence field in result; warn user |
+| Evo2 API 401 | Invalid API key | Fall back to offline mode automatically |
+| gnomAD returns no data | Very rare or novel variant | AF treated as 0 (log10(1e-8) = −8), which is a strong pathogenic signal |
