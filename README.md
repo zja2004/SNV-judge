@@ -45,7 +45,7 @@ Trained on **2,000 ClinVar missense variants** across **547 genes** (balanced 1:
 - **Variant history** *(v5)*: Session-level query history with side-by-side SHAP comparison
 - **Reliability diagram** *(v5)*: Model calibration curve in Model Info panel
 - **Interpretability**: Per-variant SHAP feature contribution chart + `print_shap_summary()` CLI output
-- **🤖 AI Clinical Report**: Kimi LLM (Moonshot AI) synthesizes all tool outputs into a structured ACMG-style clinical interpretation report — Chinese / English / Summary templates
+- **🤖 AI Clinical Report**: Any OpenAI-compatible LLM (Moonshot Kimi, Alibaba Qwen, OpenAI, DeepSeek, etc.) synthesizes all tool outputs into a structured ACMG-style clinical interpretation report — Chinese / English / Summary templates; in-app provider/model selector with auto model-list fetch
 - **Offline CLI** *(v5.2)*: `skill/scripts/predict.py` for batch VCF scoring without the Streamlit UI
 - **Interactive UI**: Streamlit app with pathogenicity gauge, score bar chart, SHAP visualization, history tab, and AI report tab
 
@@ -250,12 +250,19 @@ pip install -r requirements.txt
 ```bash
 export EVO2_API_KEY="your-nvidia-nim-api-key"    # https://build.nvidia.com/arc-institute/evo2
 export GENOS_API_KEY="your-stomics-api-key"       # https://cloud.stomics.tech
-export KIMI_API_KEY="sk-..."                      # https://platform.moonshot.cn
+
+# LLM backend for AI Clinical Report — any OpenAI-compatible provider
+export LLM_API_KEY="sk-..."                       # API key for your chosen provider
+export LLM_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"  # default: Moonshot
+export LLM_MODEL="qwen-plus"                      # default: moonshot-v1-32k
+
+# Legacy alias (still works)
+# export KIMI_API_KEY="sk-..."                    # treated as LLM_API_KEY with Moonshot base URL
 ```
 
 > Without Evo2/Genos keys, the app falls back to the 4-feature base model (SIFT, PolyPhen, AlphaMissense, CADD).  
-> Without `KIMI_API_KEY`, the AI Clinical Report tab is disabled (all other features remain functional).  
-> Both Kimi and Genos Embedding URL can be entered directly in the app's Settings panel without restarting.
+> Without an LLM API key, the AI Clinical Report tab is disabled (all other features remain functional).  
+> **All LLM settings (Base URL, API Key, model) can be configured directly in the app's Settings panel** — no restart needed. The panel auto-fetches the model list from your chosen endpoint.
 
 ### 3. Run the Streamlit app
 

@@ -46,7 +46,7 @@
 - **变异历史记录** *(v5)*：会话级查询历史，支持并排 SHAP 对比
 - **可靠性图** *(v5)*：模型信息面板中的校准曲线
 - **可解释性**：每个变异的 SHAP 特征贡献图 + `print_shap_summary()` 终端输出
-- **🤖 AI 临床报告**：Kimi LLM（Moonshot AI）将所有工具输出综合为结构化 ACMG 风格临床解读报告——支持中文 / 英文 / 摘要三种模板
+- **🤖 AI 临床报告**：支持任意 OpenAI 兼容 LLM（Moonshot Kimi、阿里云百炼 Qwen、OpenAI、DeepSeek 等），将所有工具输出综合为结构化 ACMG 风格临床解读报告——支持中文 / 英文 / 摘要三种模板；应用内服务商/模型选择器，支持自动拉取模型列表
 - **离线 CLI** *(v5.2)*：`skill/scripts/predict.py` 支持无 Streamlit UI 的批量 VCF 评分
 - **交互式界面**：Streamlit 应用，含致病性仪表盘、评分条形图、SHAP 可视化、历史记录标签页和 AI 报告标签页
 
@@ -251,12 +251,19 @@ pip install -r requirements.txt
 ```bash
 export EVO2_API_KEY="your-nvidia-nim-api-key"    # https://build.nvidia.com/arc-institute/evo2
 export GENOS_API_KEY="your-stomics-api-key"       # https://cloud.stomics.tech
-export KIMI_API_KEY="sk-..."                      # https://platform.moonshot.cn — 启用 AI 临床报告
+
+# AI 临床报告 LLM 后端 — 支持任意 OpenAI 兼容接口
+export LLM_API_KEY="sk-..."                       # 你选择的服务商 API Key
+export LLM_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"  # 默认：Moonshot
+export LLM_MODEL="qwen-plus"                      # 默认：moonshot-v1-32k
+
+# 旧版兼容（仍然有效）
+# export KIMI_API_KEY="sk-..."                    # 等同于 LLM_API_KEY + Moonshot Base URL
 ```
 
 > 不设置 Evo2/Genos Key 时，应用降级为 4 特征基础模型（SIFT、PolyPhen、AlphaMissense、CADD）。  
-> 不设置 `KIMI_API_KEY` 时，AI 临床报告标签页禁用（其他功能正常）。  
-> Kimi API Key 和 Genos Embedding URL 均可直接在应用的设置面板中输入，无需重启。
+> 不设置 LLM API Key 时，AI 临床报告标签页禁用（其他功能正常）。  
+> **所有 LLM 设置（Base URL、API Key、模型）均可在应用设置面板中直接配置**，无需重启。面板支持自动拉取所选服务商的模型列表。
 
 ### 3. 启动 Streamlit 应用
 

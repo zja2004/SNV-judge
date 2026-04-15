@@ -51,12 +51,15 @@ st.set_page_config(
 # ── API keys (from environment variables) ─────────────────────────────────
 EVO2_API_KEY  = os.environ.get("EVO2_API_KEY", "")
 GENOS_API_KEY = os.environ.get("GENOS_API_KEY", "")
-KIMI_API_KEY  = os.environ.get("KIMI_API_KEY", "")
+# LLM backend — supports any OpenAI-compatible endpoint
+# Priority: LLM_API_KEY > KIMI_API_KEY (legacy)
+LLM_API_KEY  = os.environ.get("LLM_API_KEY") or os.environ.get("KIMI_API_KEY", "")
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.moonshot.cn/v1")
+LLM_MODEL    = os.environ.get("LLM_MODEL", "moonshot-v1-32k")
 
-# Inject KIMI_API_KEY into kimi_report module at import time
 import kimi_report as _kimi_mod
-if KIMI_API_KEY:
-    _kimi_mod.KIMI_API_KEY = KIMI_API_KEY
+# Keep legacy alias for backward compat
+KIMI_API_KEY = LLM_API_KEY
 
 # ── Genos-10B local embedding scoring (v5.2, optional) ────────────────────
 # Import fetch_genos_embedding_score from the offline predict script.
@@ -732,7 +735,7 @@ model_badge = _ver_labels.get(MODEL_VER, MODEL_VER)
 ai_status   = []
 if EVO2_API_KEY:  ai_status.append("Evo2 ✓")
 if GENOS_API_KEY: ai_status.append("Genos ✓")
-if KIMI_API_KEY:  ai_status.append("Kimi ✓")
+if LLM_API_KEY:  ai_status.append("LLM ✓")
 ai_badge = " · ".join(ai_status) if ai_status else "AI models disabled (no API keys)"
 
 st.title("🧬 SNV Pathogenicity Predictor")
@@ -922,10 +925,10 @@ with tab_single:
 
         # ── AI Clinical Report button (inline, inside single-variant results) ──
         st.subheader("🤖 AI 智能临床解读")
-        if not KIMI_API_KEY:
+        _sv_llm_key = st.session_state.get("llm_api_key", LLM_API_KEY)
+        if not _sv_llm_key:
             st.info(
-                "设置 `KIMI_API_KEY` 环境变量以启用 Kimi AI 临床报告生成。  \n"
-                "```bash\nexport KIMI_API_KEY='sk-...'\n```"
+                "在「🤖 AI Clinical Report」标签页的设置面板中配置 LLM API Key，即可启用 AI 临床报告。"
             )
         else:
             if st.button("✨ 生成 AI 临床解读报告", type="secondary", use_container_width=False):
@@ -943,7 +946,11 @@ with tab_single:
                 st.session_state["last_model_ver"]      = MODEL_VER
                 st.session_state["trigger_report"]      = True
 
-                with st.spinner("Kimi 正在生成临床解读报告…"):
+                _sv_url   = st.session_state.get("llm_base_url", LLM_BASE_URL)
+                _sv_key   = st.session_state.get("llm_api_key", LLM_API_KEY)
+                _sv_model = st.session_state.get("llm_model", LLM_MODEL)
+                _sv_provider = st.session_state.get("llm_provider_name", "LLM")
+                with st.spinner(f"{_sv_provider} 正在生成临床解读报告…"):
                     report_placeholder = st.empty()
                     full_report = ""
                     try:
@@ -951,6 +958,7 @@ with tab_single:
                             variant_info, scores, shap_vals, cal_prob,
                             evo2_llr, genos_path, gnomad_log_af, MODEL_VER,
                             template="chinese",
+                            base_url=_sv_url, api_key=_sv_key, model=_sv_model,
                         ):
                             full_report += chunk
                             report_placeholder.markdown(full_report + "▌")
@@ -958,7 +966,7 @@ with tab_single:
                         st.session_state["last_report"] = full_report
                         st.success("报告生成完成！可在「🤖 AI Clinical Report」标签页查看完整报告。")
                     except Exception as e:
-                        st.error(f"Kimi API 调用失败: {e}")
+                        st.error(f"LLM API 调用失败: {e}")
 
         st.divider()
         with st.expander("Raw scores table"):
@@ -1300,7 +1308,8 @@ with tab_history:
 with tab_report:
     st.subheader("🤖 AI 智能临床变异解读报告")
     st.markdown(
-        "本模块由 **Kimi（Moonshot AI）** 驱动，将 SNV-judge v4 智能体系统的多源证据  \n"
+        "本模块支持任意 **OpenAI 兼容 LLM**（Moonshot Kimi、阿里云百炼 Qwen、OpenAI、DeepSeek 等），"
+        "将 SNV-judge v5 智能体系统的多源证据  \n"
         "（VEP · Evo2 · Genos · gnomAD · SHAP）转化为结构化 ACMG 风格临床解读报告。"
     )
     st.divider()
@@ -1308,24 +1317,97 @@ with tab_report:
     # ── API key input (sidebar override) ─────────────────────────────────
     _cfg_col1, _cfg_col2 = st.columns(2)
 
-    with _cfg_col1.expander("⚙️ Kimi API 设置", expanded=not bool(KIMI_API_KEY)):
-        kimi_key_input = st.text_input(
-            "Kimi API Key",
-            value=KIMI_API_KEY,
+    with _cfg_col1.expander("⚙️ LLM 设置", expanded=not bool(st.session_state.get("llm_api_key", LLM_API_KEY))):
+        # Provider preset selector
+        _preset_options = list(_kimi_mod.PROVIDER_PRESETS.keys())
+        _preset_sel = st.selectbox(
+            "服务商预设",
+            options=_preset_options,
+            index=0,
+            key="llm_provider_sel",
+            help="选择预设后自动填充 Base URL；选「自定义」可手动输入任意 OpenAI 兼容地址。",
+        )
+        _preset_url = _kimi_mod.PROVIDER_PRESETS.get(_preset_sel, "")
+
+        # Base URL input
+        _url_default = st.session_state.get("llm_base_url", LLM_BASE_URL)
+        llm_url_input = st.text_input(
+            "Base URL",
+            value=_preset_url if _preset_sel != "自定义 / Custom" else _url_default,
+            placeholder="https://api.moonshot.cn/v1",
+            key="llm_url_input",
+            help="OpenAI 兼容 API 的 Base URL，末尾不需要加 /",
+        )
+
+        # API Key input
+        llm_key_input = st.text_input(
+            "API Key",
+            value=st.session_state.get("llm_api_key", LLM_API_KEY),
             type="password",
             placeholder="sk-...",
-            help="从 https://platform.moonshot.cn 获取 API Key",
+            key="llm_key_input",
         )
-        if kimi_key_input and kimi_key_input != KIMI_API_KEY:
-            _kimi_mod.KIMI_API_KEY = kimi_key_input
-            st.success("API Key 已更新（本次会话有效）")
 
-        if st.button("🔍 测试 Kimi API 连接"):
-            ok, msg = _kimi_mod.check_kimi_available()
+        # Save to session state
+        if llm_url_input:
+            st.session_state["llm_base_url"] = llm_url_input.strip()
+        if llm_key_input:
+            st.session_state["llm_api_key"] = llm_key_input.strip()
+        # Store provider display name
+        st.session_state["llm_provider_name"] = _preset_sel if _preset_sel != "自定义 / Custom" else "LLM"
+
+        # Fetch models button
+        _fetch_col, _test_col = st.columns(2)
+        if _fetch_col.button("📋 获取模型列表", key="fetch_models_btn"):
+            _url = st.session_state.get("llm_base_url", LLM_BASE_URL)
+            _key = st.session_state.get("llm_api_key", LLM_API_KEY)
+            if not _key:
+                st.error("请先输入 API Key")
+            else:
+                with st.spinner("正在获取模型列表…"):
+                    try:
+                        _models = _kimi_mod.list_models(_url, _key)
+                        st.session_state["llm_available_models"] = _models
+                        st.success(f"获取到 {len(_models)} 个模型")
+                    except Exception as _e:
+                        st.error(f"获取失败: {str(_e)[:100]}")
+
+        if _test_col.button("🔍 测试连接", key="test_llm_btn"):
+            _url = st.session_state.get("llm_base_url", LLM_BASE_URL)
+            _key = st.session_state.get("llm_api_key", LLM_API_KEY)
+            _mdl = st.session_state.get("llm_model", LLM_MODEL)
+            ok, msg = _kimi_mod.check_available(_url, _key, _mdl)
             if ok:
                 st.success(msg)
             else:
                 st.error(msg)
+
+        # Model selector
+        _avail_models = st.session_state.get("llm_available_models", [])
+        if _avail_models:
+            _cur_model = st.session_state.get("llm_model", LLM_MODEL)
+            _model_idx = _avail_models.index(_cur_model) if _cur_model in _avail_models else 0
+            _selected_model = st.selectbox(
+                "选择模型",
+                options=_avail_models,
+                index=_model_idx,
+                key="llm_model_sel",
+            )
+            st.session_state["llm_model"] = _selected_model
+        else:
+            _manual_model = st.text_input(
+                "模型 ID（手动输入，或先点「获取模型列表」）",
+                value=st.session_state.get("llm_model", LLM_MODEL),
+                key="llm_model_manual",
+                placeholder="moonshot-v1-32k / qwen-plus / gpt-4o",
+            )
+            if _manual_model:
+                st.session_state["llm_model"] = _manual_model.strip()
+
+        # Current config summary
+        _cur_url = st.session_state.get("llm_base_url", LLM_BASE_URL)
+        _cur_mdl = st.session_state.get("llm_model", LLM_MODEL)
+        st.caption(f"当前配置：`{_cur_url}` · 模型 `{_cur_mdl}`")
 
     with _cfg_col2.expander("⚙️ Genos Embedding 设置 (v5.2)", expanded=False):
         st.markdown(
@@ -1448,8 +1530,8 @@ with tab_report:
         else:
             # Fresh fetch from manual input
             chrom_r = r_chrom.replace("chr", "")
-            if not _kimi_mod.KIMI_API_KEY:
-                st.error("请先设置 Kimi API Key（见上方设置面板）")
+            if not st.session_state.get("llm_api_key", LLM_API_KEY):
+                st.error("请先在上方设置面板中配置 LLM API Key")
                 st.stop()
 
             with st.spinner(f"正在获取 {chrom_r}:{r_pos} {r_ref}>{r_alt} 的评分…"):
@@ -1491,11 +1573,16 @@ with tab_report:
                     "🇬🇧 English Clinical Report": "english",
                     "📝 简版摘要":                 "summary",
                 }
-                with st.spinner("Kimi 正在分析多源证据，生成临床解读报告…"):
+                _ar_url      = st.session_state.get("llm_base_url", LLM_BASE_URL)
+                _ar_key      = st.session_state.get("llm_api_key", LLM_API_KEY)
+                _ar_model    = st.session_state.get("llm_model", LLM_MODEL)
+                _ar_provider = st.session_state.get("llm_provider_name", "LLM")
+                with st.spinner(f"{_ar_provider} 正在分析多源证据，生成临床解读报告…"):
                     for chunk in _kimi_mod.generate_report_stream(
                         v_info, v_scores, v_shap, v_prob,
                         v_evo2, v_genos, v_gnomad, v_model_ver,
                         template=_tmpl_map.get(_tmpl, "chinese"),
+                        base_url=_ar_url, api_key=_ar_key, model=_ar_model,
                     ):
                         full_report += chunk
                         report_area.markdown(full_report + "▌")
@@ -1511,8 +1598,8 @@ with tab_report:
                     mime="text/markdown",
                 )
             except Exception as e:
-                st.error(f"Kimi API 调用失败: {str(e)}")
-                st.info("请检查 API Key 是否正确，或稍后重试。")
+                st.error(f"LLM API 调用失败: {str(e)}")
+                st.info("请检查 API Key 和 Base URL 是否正确，或稍后重试。")
 
     elif not st.session_state.get("last_report"):
         st.info(
@@ -1534,7 +1621,7 @@ st.markdown("---")
 st.caption(
     "Data: ClinVar · Ensembl VEP · AlphaMissense (Google DeepMind) · CADD v1.7 · "
     "Evo2 (Arc Institute / NVIDIA) · Genos (Zhejiang Lab) · SIFT · PolyPhen-2 · gnomAD v4.  \n"
-    "AI Report: Kimi (Moonshot AI, moonshot-v1-32k). "
+    "AI Report: Universal LLM backend (OpenAI-compatible; Moonshot Kimi / Alibaba Qwen / OpenAI / DeepSeek). "
     "Model trained on GRCh38 ClinVar gold-standard missense variants. "
     "**Not validated for clinical use.**"
 )

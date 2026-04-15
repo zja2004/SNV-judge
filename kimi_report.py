@@ -1,21 +1,31 @@
 """
-kimi_report.py — AI-powered clinical variant interpretation report
-===================================================================
-Uses Kimi (Moonshot AI) to generate structured ACMG-style clinical
-interpretation reports from SNV-judge v4 prediction results.
+kimi_report.py — Universal LLM Clinical Variant Interpretation Report
+======================================================================
+Supports any OpenAI-compatible API endpoint (Moonshot/Kimi, Alibaba DashScope,
+OpenAI, DeepSeek, Qwen, etc.).
 
 The module acts as the "reasoning layer" of the SNV-judge agent:
-  Tool outputs (VEP, Evo2, Genos, gnomAD, SHAP) → Kimi LLM → Clinical report
+  Tool outputs (VEP, Evo2, Genos, gnomAD, SHAP) → LLM → Clinical report
+
+Configuration (in priority order):
+  1. Runtime arguments passed to generate_report_stream() / generate_report()
+  2. Environment variables: LLM_API_KEY, LLM_BASE_URL, LLM_MODEL
+  3. Legacy env vars: KIMI_API_KEY (treated as LLM_API_KEY with Moonshot base URL)
 
 Usage:
-    from kimi_report import generate_report_stream, generate_report
+    from kimi_report import generate_report_stream, generate_report, list_models
+
+    # List available models for a given endpoint
+    models = list_models("https://dashscope.aliyuncs.com/compatible-mode/v1", "sk-xxx")
 
     # Streaming (for Streamlit st.write_stream)
-    for chunk in generate_report_stream(variant_info, scores, shap_vals, cal_prob):
+    for chunk in generate_report_stream(
+        variant_info, scores, shap_vals, cal_prob,
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        api_key="sk-xxx",
+        model="qwen-plus",
+    ):
         print(chunk, end="", flush=True)
-
-    # Non-streaming (returns full string)
-    report = generate_report(variant_info, scores, shap_vals, cal_prob)
 """
 
 import os
@@ -23,50 +33,101 @@ import math
 import numpy as np
 from typing import Generator
 
-# Kimi API — OpenAI-compatible
-KIMI_API_KEY  = os.environ.get("KIMI_API_KEY", "")
-KIMI_BASE_URL = "https://api.moonshot.cn/v1"
-KIMI_MODEL    = "moonshot-v1-32k"
+# ── Default configuration (env vars or legacy Kimi fallback) ──────────────
+_ENV_API_KEY  = os.environ.get("LLM_API_KEY") or os.environ.get("KIMI_API_KEY", "")
+_ENV_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.moonshot.cn/v1")
+_ENV_MODEL    = os.environ.get("LLM_MODEL", "moonshot-v1-32k")
+
+# Legacy aliases kept for backward compatibility
+KIMI_API_KEY  = _ENV_API_KEY
+KIMI_BASE_URL = _ENV_BASE_URL
+KIMI_MODEL    = _ENV_MODEL
 
 # ACMG classification thresholds (matching app.py)
-PATHOGENIC_THRESH  = 0.70
-BENIGN_THRESH      = 0.40
-
-# Feature display names and their ACMG relevance
-FEATURE_ACMG = {
-    "SIFT (inv)":      ("PP3/BP4", "sequence conservation (SIFT)"),
-    "PolyPhen-2":      ("PP3/BP4", "structural impact (PolyPhen-2)"),
-    "AlphaMissense":   ("PP3/BP4", "structure-based pathogenicity (AlphaMissense)"),
-    "CADD Phred":      ("PP3/BP4", "combined annotation depletion (CADD)"),
-    "Evo2 LLR":        ("PP3/BP4", "evolutionary language model log-likelihood (Evo2-40B)"),
-    "Genos Score":     ("PP3/BP4", "human-centric genomic foundation model (Genos-10B)"),
-    "phyloP":          ("PP3/BP4", "vertebrate phylogenetic conservation (phyloP)"),
-    "gnomAD log-AF":   ("BA1/PM2", "population allele frequency (gnomAD v4)"),
-}
+PATHOGENIC_THRESH = 0.70
+BENIGN_THRESH     = 0.40
 
 FEATURE_LABELS = [
     "SIFT (inv)", "PolyPhen-2", "AlphaMissense", "CADD Phred",
     "Evo2 LLR", "Genos Score", "phyloP", "gnomAD log-AF",
 ]
 
+FEATURE_ACMG = {
+    "SIFT (inv)":    ("PP3/BP4", "sequence conservation (SIFT)"),
+    "PolyPhen-2":    ("PP3/BP4", "structural impact (PolyPhen-2)"),
+    "AlphaMissense": ("PP3/BP4", "structure-based pathogenicity (AlphaMissense)"),
+    "CADD Phred":    ("PP3/BP4", "combined annotation depletion (CADD)"),
+    "Evo2 LLR":      ("PP3/BP4", "evolutionary language model log-likelihood (Evo2-40B)"),
+    "Genos Score":   ("PP3/BP4", "human-centric genomic foundation model (Genos-10B)"),
+    "phyloP":        ("PP3/BP4", "vertebrate phylogenetic conservation (phyloP)"),
+    "gnomAD log-AF": ("BA1/PM2", "population allele frequency (gnomAD v4)"),
+}
 
-def _get_kimi_client():
-    """Return an OpenAI client pointed at Kimi API."""
+# ── Known provider presets ─────────────────────────────────────────────────
+PROVIDER_PRESETS = {
+    "Moonshot (Kimi)":   "https://api.moonshot.cn/v1",
+    "Alibaba DashScope": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "OpenAI":            "https://api.openai.com/v1",
+    "DeepSeek":          "https://api.deepseek.com/v1",
+    "自定义 / Custom":   "",
+}
+
+
+# ── Model listing ──────────────────────────────────────────────────────────
+
+def list_models(base_url: str, api_key: str) -> list[str]:
+    """
+    Fetch available model IDs from any OpenAI-compatible endpoint.
+
+    Returns a sorted list of model ID strings, or raises on failure.
+    """
     try:
         from openai import OpenAI
     except ImportError:
         raise ImportError("openai package required: pip install openai>=1.0")
-    key = KIMI_API_KEY
+
+    client = OpenAI(api_key=api_key, base_url=base_url.rstrip("/"))
+    models = client.models.list()
+    ids = sorted({m.id for m in models.data})
+    return ids
+
+
+def check_available(
+    base_url: str | None = None,
+    api_key: str | None = None,
+    model: str | None = None,
+) -> tuple[bool, str]:
+    """
+    Check if the LLM endpoint is reachable and the key is valid.
+    Falls back to env-var defaults when arguments are None.
+
+    Returns:
+        (is_available: bool, message: str)
+    """
+    url = base_url or _ENV_BASE_URL
+    key = api_key or _ENV_API_KEY
+    mdl = model or _ENV_MODEL
+
     if not key:
-        raise ValueError(
-            "KIMI_API_KEY not set. "
-            "Set environment variable: export KIMI_API_KEY='sk-...'"
-        )
-    return OpenAI(api_key=key, base_url=KIMI_BASE_URL)
+        return False, "未设置 API Key（LLM_API_KEY 环境变量或应用内输入）"
+    try:
+        ids = list_models(url, key)
+        if mdl in ids:
+            return True, f"连接正常（模型: {mdl}，共 {len(ids)} 个可用模型）"
+        else:
+            return True, f"连接正常（共 {len(ids)} 个可用模型，当前选择: {mdl}）"
+    except Exception as e:
+        return False, f"连接失败: {str(e)[:120]}"
 
 
-def _format_gnomad_af(log_af: float | None) -> str:
-    """Convert log10 AF back to human-readable frequency string."""
+# Legacy alias
+def check_kimi_available() -> tuple[bool, str]:
+    return check_available()
+
+
+# ── Evidence formatting helpers ────────────────────────────────────────────
+
+def _format_gnomad_af(log_af) -> str:
     if log_af is None or (isinstance(log_af, float) and math.isnan(log_af)):
         return "未在gnomAD v4中检索到（可能为新发变异，PM2证据）"
     af = 10 ** log_af
@@ -82,7 +143,7 @@ def _format_gnomad_af(log_af: float | None) -> str:
         return f"常见变异（AF ≈ {af:.3f}，BA1强良性证据）"
 
 
-def _format_phylop(phylop: float | None) -> str:
+def _format_phylop(phylop) -> str:
     if phylop is None or (isinstance(phylop, float) and math.isnan(phylop)):
         return "无数据"
     if phylop > 2.0:
@@ -95,7 +156,7 @@ def _format_phylop(phylop: float | None) -> str:
         return f"{phylop:.2f}（进化加速，约束弱）"
 
 
-def _format_evo2(evo2_llr: float | None) -> str:
+def _format_evo2(evo2_llr) -> str:
     if evo2_llr is None or (isinstance(evo2_llr, float) and math.isnan(evo2_llr)):
         return "未获取（需要Evo2 API密钥）"
     if evo2_llr < -1.0:
@@ -111,16 +172,14 @@ def _format_evo2(evo2_llr: float | None) -> str:
 def _build_evidence_context(
     variant_info: dict,
     scores: dict,
-    shap_vals: np.ndarray | list,
+    shap_vals,
     cal_prob: float,
     evo2_llr: float = float("nan"),
     genos_path: float = float("nan"),
     gnomad_log_af: float = float("nan"),
-    model_ver: str = "v4",
+    model_ver: str = "v5",
 ) -> str:
-    """Build a structured evidence summary string to pass to Kimi."""
-
-    # Classification
+    """Build structured evidence summary string to pass to the LLM."""
     if cal_prob >= PATHOGENIC_THRESH:
         classification = f"可能致病（Likely Pathogenic，概率 {cal_prob:.1%}）"
     elif cal_prob >= BENIGN_THRESH:
@@ -128,211 +187,111 @@ def _build_evidence_context(
     else:
         classification = f"可能良性（Likely Benign，概率 {cal_prob:.1%}）"
 
-    # SHAP top contributors
     labels = FEATURE_LABELS[:len(shap_vals)]
     shap_pairs = sorted(zip(labels, shap_vals), key=lambda x: abs(x[1]), reverse=True)
-    shap_lines = []
-    for feat, sv in shap_pairs:
-        direction = "→致病" if sv > 0 else "→良性"
-        shap_lines.append(f"  • {feat}: SHAP={sv:+.4f} {direction}")
+    shap_lines = [
+        f"  • {feat}: SHAP={sv:+.4f} {'→致病' if sv > 0 else '→良性'}"
+        for feat, sv in shap_pairs
+    ]
 
-    # gnomAD
-    gnomad_str = _format_gnomad_af(gnomad_log_af)
-
-    # phyloP
     phylop_raw = scores.get("phylop")
-    phylop_val = float(phylop_raw) if phylop_raw is not None else (
-        gnomad_log_af if False else float("nan")  # keep nan if missing
+    phylop_str = _format_phylop(float(phylop_raw) if phylop_raw is not None else None)
+
+    genos_str = (
+        "未获取（需要Genos API密钥）"
+        if genos_path is None or (isinstance(genos_path, float) and math.isnan(genos_path))
+        else f"{genos_path:.4f}（{'高' if genos_path > 0.7 else '中' if genos_path > 0.4 else '低'}致病性评分）"
     )
-    phylop_str = _format_phylop(phylop_val if phylop_raw is not None else None)
 
-    # Evo2
-    evo2_str = _format_evo2(evo2_llr)
-
-    # Genos
-    if genos_path is None or (isinstance(genos_path, float) and math.isnan(genos_path)):
-        genos_str = "未获取（需要Genos API密钥）"
-    else:
-        genos_str = f"{genos_path:.4f}（{'高' if genos_path > 0.7 else '中' if genos_path > 0.4 else '低'}致病性评分）"
-
-    context = f"""
+    return f"""
 === 变异基本信息 ===
-变异位置: chr{variant_info.get('chrom', '?')}:{variant_info.get('pos', '?')} {variant_info.get('ref', '?')}>{variant_info.get('alt', '?')} (GRCh38)
-基因: {scores.get('gene', '未知')}
-转录本: {scores.get('transcript', '未知')}
-蛋白变化: {scores.get('hgvsp', '未知')}
-变异类型: {scores.get('consequence', '未知')}
+变异位置: chr{variant_info.get('chrom','?')}:{variant_info.get('pos','?')} {variant_info.get('ref','?')}>{variant_info.get('alt','?')} (GRCh38)
+基因: {scores.get('gene','未知')}
+转录本: {scores.get('transcript','未知')}
+蛋白变化: {scores.get('hgvsp','未知')}
+变异类型: {scores.get('consequence','未知')}
 
-=== SNV-judge v4 集成预测结果 ===
+=== SNV-judge {model_ver} 集成预测结果 ===
 校准概率: {cal_prob:.4f} ({cal_prob:.1%})
 综合分类建议: {classification}
 使用模型版本: {model_ver}（8特征集成：4个经典工具 + Evo2 + Genos + phyloP + gnomAD AF）
 
 === 各工具评分详情 ===
-1. SIFT (inv): {f"{1 - scores['sift_score']:.4f} ({scores.get('sift_pred', '')})" if scores.get('sift_score') is not None else "无数据"}
-   解读: SIFT > 0.5 提示氨基酸替换有害（PP3证据）
-
-2. PolyPhen-2: {f"{scores['polyphen_score']:.4f} ({scores.get('polyphen_pred', '')})" if scores.get('polyphen_score') is not None else "无数据"}
-   解读: > 0.85 = probably_damaging（PP3证据）
-
-3. AlphaMissense: {f"{scores['am_pathogenicity']:.4f} ({scores.get('am_class', '')})" if scores.get('am_pathogenicity') is not None else "无数据"}
-   解读: > 0.564 = likely_pathogenic（PP3证据）
-
+1. SIFT (inv): {f"{1 - scores['sift_score']:.4f} ({scores.get('sift_pred','')})" if scores.get('sift_score') is not None else "无数据"}
+2. PolyPhen-2: {f"{scores['polyphen_score']:.4f} ({scores.get('polyphen_pred','')})" if scores.get('polyphen_score') is not None else "无数据"}
+3. AlphaMissense: {f"{scores['am_pathogenicity']:.4f} ({scores.get('am_class','')})" if scores.get('am_pathogenicity') is not None else "无数据"}
 4. CADD Phred: {f"{scores['cadd_phred']:.2f}" if scores.get('cadd_phred') is not None else "无数据"}
-   解读: > 20 = 前1%最有害变异（PP3证据）；> 30 = 前0.1%
-
-5. Evo2-40B LLR（基因组语言模型）: {evo2_str}
-   解读: 负值表示替代等位基因在进化语言模型中概率更低，支持功能损害
-
-6. Genos-10B（人类基因组基础模型）: {genos_str}
-   解读: 基于人类基因组训练的致病性专项评分
-
-7. phyloP保守性评分: {phylop_str}
-   解读: 高保守位点突变更可能有害（PP3证据）
-
-8. gnomAD v4等位基因频率: {gnomad_str}
-   解读: 遵循ACMG BA1（AF>5%=良性）/ PM2（极罕见=致病支持）规则
+5. Evo2-40B LLR: {_format_evo2(evo2_llr)}
+6. Genos-10B: {genos_str}
+7. phyloP: {phylop_str}
+8. gnomAD v4 AF: {_format_gnomad_af(gnomad_log_af)}
 
 === SHAP特征贡献分析（按重要性排序）===
 {chr(10).join(shap_lines)}
 
 === AlphaMissense分类 ===
-{scores.get('am_class', '未知')}（AlphaMissense官方分类）
+{scores.get('am_class','未知')}
 """.strip()
-
-    return context
 
 
 def _build_system_prompt(template: str = "chinese") -> str:
-    """Return system prompt for the given template.
-
-    Args:
-        template: one of "chinese" | "english" | "summary"
-    """
     if template == "english":
-        return """You are an expert clinical geneticist and genomic variant interpretation specialist with:
-- Deep knowledge of ACMG/AMP 2015 variant classification guidelines (Richards et al., Genetics in Medicine 2015)
-- Expertise in genomic foundation models (Evo2, Genos) and classical annotation tools (SIFT, PolyPhen-2, AlphaMissense, CADD)
-- Familiarity with gnomAD population frequency database and phyloP evolutionary conservation scores
-
-Your task is to generate a professional clinical variant interpretation report based on multi-source evidence from the SNV-judge v5 system.
-
-Requirements:
-1. Write entirely in English
-2. Use structured sections with clear headings
-3. Explicitly cite ACMG evidence criteria (PP3, PM2, BA1, etc.)
-4. Provide concise interpretation for each tool's result
-5. Give a final ACMG classification with supporting evidence summary
-6. Professional tone suitable for clinical genetics consultation
-7. End with disclaimer: AI-assisted report, for research reference only
-
-Report format (strictly follow this structure):
-## Variant Interpretation Report
-
-### I. Variant Information
-[Coordinates, gene, protein change, etc.]
-
-### II. Integrated Prediction
-[SNV-judge v5 calibrated probability and ACMG classification]
-
-### III. Multi-dimensional Evidence Analysis
-#### 3.1 Classical Annotation Tools (PP3/BP4)
-[SIFT, PolyPhen-2, AlphaMissense, CADD results and ACMG evidence strength]
-
-#### 3.2 Genomic Foundation Model Evidence
-[Evo2-40B and Genos-10B result interpretation]
-
-#### 3.3 Evolutionary Conservation (PP3/BP4)
-[phyloP score interpretation]
-
-#### 3.4 Population Frequency Evidence (BA1/PM2)
-[gnomAD AF interpretation and ACMG criteria]
-
-#### 3.5 SHAP Feature Contribution Analysis
-[Which features drove the prediction and their biological significance]
-
-### IV. ACMG Classification Summary
-[Final classification: Pathogenic/Likely Pathogenic/VUS/Likely Benign/Benign]
-[Key supporting evidence]
-
-### V. Clinical Significance and Recommendations
-[Clinical implications and suggested follow-up steps]
-
-### VI. Limitations
-[Data gaps, model limitations, caveats]
-
----
-*This report was auto-generated by SNV-judge v5 (Kimi AI-assisted). For research reference only. Not for clinical diagnosis.*"""
-
+        return (
+            "You are an expert clinical geneticist. Generate a professional clinical variant "
+            "interpretation report in English based on multi-source evidence from SNV-judge v5.\n\n"
+            "Requirements:\n"
+            "1. Structured sections with clear headings\n"
+            "2. Explicitly cite ACMG evidence criteria (PP3, PM2, BA1, etc.)\n"
+            "3. Professional tone suitable for clinical genetics consultation\n"
+            "4. End with: *AI-assisted report, for research reference only.*\n\n"
+            "Report format:\n"
+            "## Variant Interpretation Report\n"
+            "### I. Variant Information\n"
+            "### II. Integrated Prediction\n"
+            "### III. Multi-dimensional Evidence Analysis\n"
+            "#### 3.1 Classical Tools (PP3/BP4)\n"
+            "#### 3.2 Genomic Foundation Models\n"
+            "#### 3.3 Evolutionary Conservation (PP3/BP4)\n"
+            "#### 3.4 Population Frequency (BA1/PM2)\n"
+            "#### 3.5 SHAP Feature Contributions\n"
+            "### IV. ACMG Classification Summary\n"
+            "### V. Clinical Significance and Recommendations\n"
+            "### VI. Limitations\n"
+            "---\n*AI-assisted report. Not for clinical diagnosis.*"
+        )
     elif template == "summary":
-        return """你是一位临床遗传学专家。你的任务是基于SNV-judge v5系统的多源证据，生成一份简洁的变异解读摘要。
+        return (
+            "你是一位临床遗传学专家。基于SNV-judge v5系统的多源证据，生成一份简洁的变异解读摘要（3-5句话）。\n"
+            "第一句：变异信息和预测结果；第二句：最关键证据；第三句：人群频率；第四句：综合ACMG建议。\n"
+            "直接输出摘要段落，无需标题。末尾注明"AI辅助生成，仅供参考"。"
+        )
+    else:  # chinese (default)
+        return (
+            "你是一位专业的临床遗传学家和基因组变异解读专家，熟悉ACMG/AMP 2015变异分类指南。\n"
+            "基于SNV-judge v5智能体系统提供的多源证据，生成一份专业的临床变异解读报告。\n\n"
+            "要求：\n"
+            "1. 使用中文，专业术语保留英文\n"
+            "2. 明确引用ACMG证据条目（PP3、PM2、BA1等）\n"
+            "3. 语气专业，适合临床遗传咨询场景\n"
+            "4. 末尾注明：本报告由AI辅助生成，仅供参考，不构成临床诊断依据\n\n"
+            "报告格式：\n"
+            "## 变异解读报告\n"
+            "### 一、变异基本信息\n"
+            "### 二、集成预测结果\n"
+            "### 三、多维度证据分析\n"
+            "#### 3.1 经典注释工具证据（PP3/BP4）\n"
+            "#### 3.2 基因组基础模型证据\n"
+            "#### 3.3 进化保守性证据（PP3/BP4）\n"
+            "#### 3.4 人群频率证据（BA1/PM2）\n"
+            "#### 3.5 SHAP特征贡献分析\n"
+            "### 四、综合分类建议\n"
+            "### 五、临床意义与建议\n"
+            "### 六、局限性说明\n"
+            "---\n*本报告由SNV-judge v5智能体系统自动生成，仅供科研参考，不构成临床诊断依据。*"
+        )
 
-要求：
-1. 使用中文，3-5句话
-2. 第一句：变异基本信息和SNV-judge预测结果（概率+ACMG分类）
-3. 第二句：最重要的支持证据（引用1-2个最关键的工具/SHAP贡献）
-4. 第三句：人群频率证据（gnomAD）
-5. 第四句（可选）：综合ACMG分类建议和置信度
-6. 最后：注明"AI辅助生成，仅供参考"
 
-格式：直接输出摘要段落，无需标题或分节。"""
-
-    else:  # default: chinese
-        return """你是一位专业的临床遗传学家和基因组变异解读专家，具备以下专业背景：
-- 熟悉ACMG/AMP 2015变异分类指南（Richards et al., Genetics in Medicine 2015）
-- 精通基因组基础模型（Evo2、Genos）和经典变异注释工具（SIFT、PolyPhen-2、AlphaMissense、CADD）
-- 了解gnomAD人群频率数据库和phyloP进化保守性评分的临床意义
-- 能够整合多维度证据，给出结构化的变异解读报告
-
-你的任务是基于SNV-judge v5智能体系统提供的多源证据，生成一份专业的临床变异解读报告。
-
-报告要求：
-1. 使用中文撰写，专业术语保留英文
-2. 结构清晰，分节呈现
-3. 明确引用ACMG证据条目（如PP3、PM2、BA1等）
-4. 对每个工具的结果给出简洁解读
-5. 最终给出综合分类建议和临床意义说明
-6. 语气专业但易于理解，适合临床遗传咨询场景
-7. 在报告末尾注明：本报告由AI辅助生成，仅供参考，不构成临床诊断依据
-
-报告格式（严格按照以下结构）：
-## 变异解读报告
-
-### 一、变异基本信息
-[变异坐标、基因、蛋白变化等]
-
-### 二、集成预测结果
-[SNV-judge v5的综合评分和ACMG分类]
-
-### 三、多维度证据分析
-#### 3.1 经典注释工具证据（PP3/BP4）
-[SIFT、PolyPhen-2、AlphaMissense、CADD的结果和ACMG证据强度]
-
-#### 3.2 基因组基础模型证据
-[Evo2-40B和Genos-10B的结果解读]
-
-#### 3.3 进化保守性证据（PP3/BP4）
-[phyloP评分解读]
-
-#### 3.4 人群频率证据（BA1/PM2）
-[gnomAD AF解读和ACMG证据条目]
-
-#### 3.5 SHAP特征贡献分析
-[哪些特征对本次预测贡献最大，及其生物学意义]
-
-### 四、综合分类建议
-[基于ACMG框架的综合分类：致病/可能致病/VUS/可能良性/良性]
-[支持该分类的主要证据汇总]
-
-### 五、临床意义与建议
-[该变异的临床意义、建议的后续验证步骤]
-
-### 六、局限性说明
-[本次分析的局限性，包括数据缺失、模型局限等]
-
----
-*本报告由SNV-judge v5智能体系统（Kimi AI辅助）自动生成，仅供科研参考，不构成临床诊断依据。*"""
-
+# ── Core generation functions ──────────────────────────────────────────────
 
 def generate_report_stream(
     variant_info: dict,
@@ -344,18 +303,39 @@ def generate_report_stream(
     gnomad_log_af: float = float("nan"),
     model_ver: str = "v5",
     template: str = "chinese",
+    # LLM backend — if None, falls back to env-var defaults
+    base_url: str | None = None,
+    api_key: str | None = None,
+    model: str | None = None,
 ) -> Generator[str, None, None]:
     """
-    Stream Kimi-generated clinical report as text chunks.
-    Suitable for Streamlit st.write_stream().
+    Stream LLM-generated clinical report as text chunks.
+    Compatible with Streamlit st.write_stream().
 
     Args:
-        template: "chinese" | "english" | "summary"
+        base_url:  OpenAI-compatible API base URL (e.g. DashScope, Moonshot, OpenAI)
+        api_key:   API key for the chosen provider
+        model:     Model ID to use (e.g. "qwen-plus", "moonshot-v1-32k", "gpt-4o")
+        template:  "chinese" | "english" | "summary"
 
     Yields:
         str: text chunks from the LLM stream
     """
-    client = _get_kimi_client()
+    try:
+        from openai import OpenAI
+    except ImportError:
+        raise ImportError("openai package required: pip install openai>=1.0")
+
+    _url = (base_url or _ENV_BASE_URL).rstrip("/")
+    _key = api_key or _ENV_API_KEY
+    _mdl = model or _ENV_MODEL
+
+    if not _key:
+        raise ValueError(
+            "未设置 API Key。请在应用设置面板中输入，或设置环境变量 LLM_API_KEY。"
+        )
+
+    client = OpenAI(api_key=_key, base_url=_url)
     evidence = _build_evidence_context(
         variant_info, scores, shap_vals, cal_prob,
         evo2_llr, genos_path, gnomad_log_af, model_ver,
@@ -363,34 +343,32 @@ def generate_report_stream(
 
     if template == "english":
         user_msg = (
-            f"Please generate a professional clinical variant interpretation report "
-            f"based on the following multi-source evidence from the SNV-judge v5 system:\n\n"
+            "Please generate a professional clinical variant interpretation report "
+            "based on the following multi-source evidence from the SNV-judge v5 system:\n\n"
             f"{evidence}\n\n"
-            f"Follow the report format in the system prompt strictly. "
-            f"Ensure each evidence item has an explicit ACMG criterion annotation."
+            "Follow the report format in the system prompt strictly."
         )
     elif template == "summary":
         user_msg = (
-            f"请基于以下SNV-judge v5系统的多源证据，生成一份简洁的变异解读摘要（3-5句话）：\n\n"
-            f"{evidence}"
+            f"请基于以下SNV-judge v5系统的多源证据，生成一份简洁的变异解读摘要（3-5句话）：\n\n{evidence}"
         )
     else:
         user_msg = (
-            f"请基于以下SNV-judge v5智能体系统的多源证据，生成一份专业的临床变异解读报告：\n\n"
+            "请基于以下SNV-judge v5智能体系统的多源证据，生成一份专业的临床变异解读报告：\n\n"
             f"{evidence}\n\n"
-            f"请严格按照系统提示中的报告格式生成报告，确保每个证据条目都有明确的ACMG证据强度标注。"
+            "请严格按照系统提示中的报告格式生成报告，确保每个证据条目都有明确的ACMG证据强度标注。"
         )
 
     max_tokens = 512 if template == "summary" else 2048
 
     stream = client.chat.completions.create(
-        model=KIMI_MODEL,
+        model=_mdl,
         messages=[
             {"role": "system", "content": _build_system_prompt(template)},
             {"role": "user",   "content": user_msg},
         ],
-        temperature=0.3,   # lower temp for clinical consistency
-        max_completion_tokens=max_tokens,
+        temperature=0.3,
+        max_tokens=max_tokens,
         stream=True,
     )
 
@@ -410,38 +388,14 @@ def generate_report(
     gnomad_log_af: float = float("nan"),
     model_ver: str = "v5",
     template: str = "chinese",
+    base_url: str | None = None,
+    api_key: str | None = None,
+    model: str | None = None,
 ) -> str:
-    """
-    Non-streaming version: returns the full report as a string.
-    Useful for batch processing or testing.
-
-    Args:
-        template: "chinese" | "english" | "summary"
-    """
+    """Non-streaming version. Returns the full report as a string."""
     return "".join(generate_report_stream(
         variant_info, scores, shap_vals, cal_prob,
         evo2_llr, genos_path, gnomad_log_af, model_ver,
         template=template,
+        base_url=base_url, api_key=api_key, model=model,
     ))
-
-
-def check_kimi_available() -> tuple[bool, str]:
-    """
-    Check if Kimi API is available and the key is valid.
-    Returns (is_available: bool, message: str)
-    """
-    key = KIMI_API_KEY
-    if not key:
-        return False, "未设置 KIMI_API_KEY 环境变量"
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=key, base_url=KIMI_BASE_URL)
-        # Lightweight test: list models
-        models = client.models.list()
-        model_ids = [m.id for m in models.data]
-        if KIMI_MODEL in model_ids or any("moonshot" in m for m in model_ids):
-            return True, f"Kimi API 连接正常（模型: {KIMI_MODEL}）"
-        else:
-            return True, f"Kimi API 连接正常（可用模型: {', '.join(model_ids[:3])}）"
-    except Exception as e:
-        return False, f"Kimi API 连接失败: {str(e)[:100]}"
