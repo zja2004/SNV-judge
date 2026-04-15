@@ -71,8 +71,8 @@ try:
     _GENOS_EMB_AVAILABLE = True
 except Exception:
     _GENOS_EMB_AVAILABLE = False
-EVO2_URL    = "https://health.api.nvidia.com/v1/biology/arc/evo2-40b/generate"
-GENOS_URL   = "https://cloud.stomics.tech/api/aigateway/genos/variant_predict"
+EVO2_URL    = os.environ.get("EVO2_URL",   "https://health.api.nvidia.com/v1/biology/arc/evo2-40b/generate")
+GENOS_URL   = os.environ.get("GENOS_URL",  "https://cloud.stomics.tech/api/aigateway/genos/variant_predict")
 GNOMAD_URL  = "https://gnomad.broadinstitute.org/api"
 ENSEMBL_SEQ_URL = "https://rest.ensembl.org/sequence/region/human"
 
@@ -302,8 +302,16 @@ def fetch_sequence_context(chrom: str, pos: int, flank: int = 50) -> str | None:
     return None
 
 # ── Evo2 scoring ──────────────────────────────────────────────────────────
-def evo2_score_variant(ref_context: str, alt_context: str) -> float:
-    """Zero-shot LLR via Evo2-40B NVIDIA NIM API."""
+def evo2_score_variant(ref_context: str, alt_context: str,
+                       url: str | None = None) -> float:
+    """Zero-shot LLR via Evo2-40B NVIDIA NIM API.
+
+    Args:
+        ref_context: 101-bp reference sequence context.
+        alt_context: 101-bp alternate sequence context.
+        url: Evo2 API endpoint. Defaults to EVO2_URL (env var or built-in default).
+    """
+    _url = (url or st.session_state.get("evo2_url", "")).strip() or EVO2_URL
     if not EVO2_API_KEY or not ref_context or not alt_context:
         return np.nan
     mid    = len(ref_context) // 2
@@ -317,7 +325,7 @@ def evo2_score_variant(ref_context: str, alt_context: str) -> float:
                    "top_k": 4, "enable_sampled_probs": True, "temperature": 0.001}
         for attempt in range(3):
             try:
-                r = requests.post(EVO2_URL, headers=hdrs, json=payload, timeout=30)
+                r = requests.post(_url, headers=hdrs, json=payload, timeout=30)
                 if r.status_code == 200:
                     p = r.json().get("sampled_probs", [None])[0]
                     log_probs[label] = np.log(p) if p and p > 0 else np.nan
@@ -332,8 +340,14 @@ def evo2_score_variant(ref_context: str, alt_context: str) -> float:
     return log_probs.get("alt", np.nan) - log_probs.get("ref", np.nan)
 
 # ── Genos scoring ─────────────────────────────────────────────────────────
-def genos_score_variant(chrom: str, pos: int, ref: str, alt: str) -> dict:
-    """Pathogenicity score from Genos (Zhejiang Lab) Stomics API."""
+def genos_score_variant(chrom: str, pos: int, ref: str, alt: str,
+                        url: str | None = None) -> dict:
+    """Pathogenicity score from Genos (Zhejiang Lab) Stomics API.
+
+    Args:
+        url: Genos Cloud API endpoint. Defaults to GENOS_URL (env var or built-in default).
+    """
+    _url = (url or st.session_state.get("genos_cloud_url", "")).strip() or GENOS_URL
     if not GENOS_API_KEY:
         return {"genos_path": np.nan}
     hdrs    = {"Authorization": f"Bearer {GENOS_API_KEY}",
@@ -342,7 +356,7 @@ def genos_score_variant(chrom: str, pos: int, ref: str, alt: str) -> dict:
                "pos": int(pos), "ref": ref, "alt": alt}
     for attempt in range(3):
         try:
-            r = requests.post(GENOS_URL, headers=hdrs, json=payload, timeout=30)
+            r = requests.post(_url, headers=hdrs, json=payload, timeout=30)
             if r.status_code == 200:
                 res = r.json().get("result", {})
                 return {"genos_path": res.get("score_Pathogenic", np.nan)}
@@ -376,13 +390,18 @@ def fetch_ai_scores(chrom: str, pos: int, ref: str, alt: str) -> tuple[float, fl
         fut_gnomad = ex.submit(fetch_gnomad_af, chrom, pos, ref, alt)
         fut_seq    = ex.submit(fetch_sequence_context, chrom, pos, 50)
 
+        # Resolve dynamic URLs from session_state (UI overrides env defaults)
+        _evo2_url_dyn  = st.session_state.get("evo2_url", "").strip() or EVO2_URL
+        _genos_url_dyn = st.session_state.get("genos_cloud_url", "").strip() or GENOS_URL
+
         if use_embedding:
             # Local Genos-10B embedding: cosine distance REF↔ALT (500bp context)
             fut_genos = ex.submit(
                 _fetch_genos_emb, chrom, pos, ref, alt, genos_embed_url
             )
         else:
-            fut_genos = ex.submit(genos_score_variant, chrom, pos, ref, alt)
+            fut_genos = ex.submit(genos_score_variant, chrom, pos, ref, alt,
+                                  _genos_url_dyn)
 
         gnomad_log_af = fut_gnomad.result()
 
@@ -396,7 +415,7 @@ def fetch_ai_scores(chrom: str, pos: int, ref: str, alt: str) -> tuple[float, fl
         if seq and len(seq) == 101 and EVO2_API_KEY:
             ref_ctx  = seq
             alt_ctx  = seq[:50] + alt + seq[51:]
-            evo2_llr = evo2_score_variant(ref_ctx, alt_ctx)
+            evo2_llr = evo2_score_variant(ref_ctx, alt_ctx, url=_evo2_url_dyn)
 
     return evo2_llr, genos_path, gnomad_log_af
 
@@ -1409,12 +1428,52 @@ with tab_report:
         _cur_mdl = st.session_state.get("llm_model", LLM_MODEL)
         st.caption(f"当前配置：`{_cur_url}` · 模型 `{_cur_mdl}`")
 
-    with _cfg_col2.expander("⚙️ Genos Embedding 设置 (v5.2)", expanded=False):
+    with _cfg_col2.expander("⚙️ AI 评分端点设置", expanded=False):
         st.markdown(
-            "**本地 Genos-10B embedding 评分**  \n"
-            "无需 Stomics Cloud API Key。通过本地 ngrok 端点计算 REF/ALT 序列余弦距离，"
-            "替代 Genos Score 的训练集中位数填充。"
+            "自定义 **Evo2** 和 **Genos** 的 API 端点。  \n"
+            "留空则使用默认值（环境变量 `EVO2_URL` / `GENOS_URL`，或内置默认地址）。"
         )
+
+        # ── Evo2 URL ──────────────────────────────────────────────────────
+        st.markdown("**Evo2（NVIDIA NIM）**")
+        _evo2_url_default = EVO2_URL  # env var or built-in default
+        evo2_url_input = st.text_input(
+            "Evo2 API URL",
+            value=st.session_state.get("evo2_url", ""),
+            placeholder=_evo2_url_default,
+            help=f"Evo2-40B 推理端点。默认：{_evo2_url_default}  \n"
+                 "需同时设置环境变量 EVO2_API_KEY 才能启用 Evo2 评分。",
+            key="evo2_url_input_field",
+        )
+        if evo2_url_input.strip() != st.session_state.get("evo2_url", ""):
+            st.session_state["evo2_url"] = evo2_url_input.strip()
+        _evo2_url_cur = st.session_state.get("evo2_url", "").strip() or _evo2_url_default
+        if EVO2_API_KEY:
+            st.caption(f"Evo2 状态：**已启用** ✓  \n端点：`{_evo2_url_cur}`")
+        else:
+            st.caption("Evo2 状态：**未启用**（需设置 `EVO2_API_KEY` 环境变量）")
+
+        st.divider()
+
+        # ── Genos Cloud URL ───────────────────────────────────────────────
+        st.markdown("**Genos Cloud（Stomics API）**")
+        _genos_cloud_default = GENOS_URL
+        genos_cloud_url_input = st.text_input(
+            "Genos Cloud API URL",
+            value=st.session_state.get("genos_cloud_url", ""),
+            placeholder=_genos_cloud_default,
+            help=f"Stomics Cloud 变异致病性预测端点。默认：{_genos_cloud_default}  \n"
+                 "需同时设置环境变量 GENOS_API_KEY 才能启用 Cloud 模式。",
+            key="genos_cloud_url_input_field",
+        )
+        if genos_cloud_url_input.strip() != st.session_state.get("genos_cloud_url", ""):
+            st.session_state["genos_cloud_url"] = genos_cloud_url_input.strip()
+        _genos_cloud_cur = st.session_state.get("genos_cloud_url", "").strip() or _genos_cloud_default
+
+        st.divider()
+
+        # ── Genos Embedding URL (local ngrok) ─────────────────────────────
+        st.markdown("**Genos Embedding（本地 ngrok，无需 API Key）**")
         genos_url_input = st.text_input(
             "Genos 本地服务器 URL",
             value=st.session_state.get("genos_embed_url", ""),
@@ -1423,23 +1482,31 @@ with tab_report:
                  "服务不可用时自动降级回训练集中位数填充。",
             key="genos_url_input_field",
         )
-        if genos_url_input != st.session_state.get("genos_embed_url", ""):
+        if genos_url_input.strip() != st.session_state.get("genos_embed_url", ""):
             st.session_state["genos_embed_url"] = genos_url_input.strip()
             if genos_url_input.strip():
-                st.success(f"Genos embedding URL 已设置（本次会话有效）")
+                st.success("Genos embedding URL 已设置（本次会话有效）")
             else:
                 st.info("Genos embedding URL 已清除，将使用训练集中位数填充。")
 
-        # 显示当前 Genos 评分模式
+        # ── 当前 Genos 评分模式摘要 ────────────────────────────────────────
+        st.divider()
         _embed_url = st.session_state.get("genos_embed_url", "").strip()
         if GENOS_API_KEY:
-            st.caption("当前模式：**Stomics Cloud API**（GENOS_API_KEY 已设置，优先级最高）")
+            st.caption(
+                f"当前 Genos 模式：**Stomics Cloud API**（GENOS_API_KEY 已设置，优先级最高）  \n"
+                f"端点：`{_genos_cloud_cur}`"
+            )
         elif _embed_url and _GENOS_EMB_AVAILABLE:
-            st.caption(f"当前模式：**本地 Genos embedding**（余弦距离，500bp 上下文）  \n"
-                       f"URL: `{_embed_url}`")
+            st.caption(
+                f"当前 Genos 模式：**本地 embedding**（余弦距离，500bp 上下文）  \n"
+                f"URL: `{_embed_url}`"
+            )
         else:
-            st.caption("当前模式：**训练集中位数填充**（Genos Score* = 0.676）  \n"
-                       "设置 URL 后可启用本地 embedding 评分。")
+            st.caption(
+                "当前 Genos 模式：**训练集中位数填充**（Genos Score* = 0.676）  \n"
+                "设置 ngrok URL 后可启用本地 embedding 评分。"
+            )
 
     st.divider()
 
