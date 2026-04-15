@@ -82,6 +82,25 @@ Per-feature AUROC contribution (5-fold CV):
 
 ![Ablation Study](figures/fig2_ablation.png)
 
+### Generalization — Leave-One-Gene-Out CV (LOGO-CV)
+
+To assess generalization beyond the training gene distribution, we performed Leave-One-Gene-Out cross-validation across 16 disease gene families. For each gene, a fresh stacking model is trained on all remaining genes and evaluated on the held-out gene's variants (n ≈ 20 per gene, 10P/10B).
+
+![LOGO-CV Generalization](figures/fig_logo_cv.png)
+
+| Gene | Disease Category | AUROC | F1 |
+|------|-----------------|-------|----|
+| BRCA1, BRCA2 | Hereditary breast/ovarian cancer | 1.000 | 0.952 / 0.909 |
+| TP53, FBN1, LDLR, GAA, USH2A, RUNX1 | Tumor suppressor / Connective / Metabolic / Retinal / Hematologic | 1.000 | 0.91–1.00 |
+| SOS1, RAF1, MSH2, MSH6 | RASopathy / Lynch MMR | 0.980–0.991 | 0.857–0.952 |
+| RYR1, MECP2 | Musculoskeletal / Neurodevelopmental | 0.930–0.955 | 0.750–0.857 |
+| MLH1 | Lynch MMR | 0.873 | 0.870 |
+| **MYH7** | **Cardiomyopathy** | **0.790** | **0.800** |
+
+**Non-BRCA mean AUROC = 0.9642** (14 genes). MYH7 is the weakest gene (AUROC = 0.79) due to its gain-of-function mechanism and atypical SIFT/PolyPhen score distribution — see [Limitations](#limitations) for details.
+
+> **Note**: Each gene has only 20–21 variants in the test set, so AUROC estimates carry wide confidence intervals (approximately ±0.10). AUROC = 1.00 for several genes reflects small-sample perfect separation, not guaranteed real-world performance.
+
 ---
 
 ## AI Clinical Report (Kimi Integration)
@@ -345,6 +364,11 @@ Genos is a 1.2B–10B parameter human-centric genomic foundation model trained o
 - gnomAD AF coverage is 37% in the training set (many ClinVar pathogenic variants are absent from gnomAD); missing values imputed with training median (log10 scale)
 - gnomAD AF alone achieves AUROC = 0.96 on variants with data, but median imputation reduces full-dataset AUC to 0.74; XGBoost learns to use the missingness pattern itself as a signal
 - gnomAD GraphQL API adds ~1–2 seconds per variant in the app; batch scoring recommended for large VCFs
+- **MYH7 (cardiomyopathy) is a known weak gene**: LOGO-CV AUROC = 0.79, the lowest among 16 tested disease genes. Three contributing factors:
+  1. **Gain-of-function mechanism**: Most MYH7 pathogenic variants act through dominant gain-of-function (altered myosin ATPase kinetics, sarcomere hypercontractility), not loss-of-function. Classical tools (SIFT, PolyPhen-2) are calibrated primarily on loss-of-function missense variants and systematically underestimate MYH7 pathogenicity.
+  2. **Intermediate sequence-based scores**: MYH7 pathogenic variants cluster in the myosin head domain (residues 167–931) but often have intermediate SIFT (0.01–0.1) and PolyPhen-2 (0.5–0.85) scores, overlapping with benign variants. AlphaMissense partially compensates but is insufficient alone.
+  3. **Small LOGO-CV test set**: Only 20 variants (10P/10B) per gene; AUROC estimates carry wide confidence intervals (~±0.10 at n=20).
+  - **Potential improvement**: Adding protein structure features (e.g., distance to myosin head ATP-binding site, inter-domain contact energy from AlphaFold2 structure) could improve MYH7 discrimination. This is a planned enhancement for v6.
 - **Not validated for clinical use**
 
 ---

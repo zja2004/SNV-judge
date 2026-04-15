@@ -21,6 +21,11 @@ predict.py — SNV-judge v5 Offline Prediction Script
   - ClinVar 实时查询（fetch_clinvar_classification）
   - CSV 批量输出（--output results.csv CLI 参数）
 
+新增功能（v5.2）：
+  - Genos-10B 本地 embedding 评分（fetch_genos_embedding_score）
+    通过 --genos-url 指定本地 ngrok 端点，计算 REF/ALT 序列余弦距离
+    替代 genos_score 的训练集中位数填充；服务不可用时自动降级回中位数
+
 Usage:
     from scripts.predict import predict_variant, load_model_artifacts
 
@@ -28,15 +33,22 @@ Usage:
     result = predict_variant("17", 7674220, "C", "T", artifacts=artifacts)
     print(result["cal_prob"], result["acmg_class"])
 
+    # 启用 Genos embedding 评分
+    result = predict_variant("17", 7674220, "C", "T", artifacts=artifacts,
+                              genos_url="https://xxx.ngrok-free.dev")
+
     results_df = predict_vcf("variants.vcf", artifacts=artifacts, output_csv="results.csv")
 
     coords = resolve_protein_variant("TP53", "R175H")
-    result = predict_variant(coords["chrom"], coords["pos"], coords["ref"], coords["alt"], artifacts=artifacts)
+    result = predict_variant(coords["chrom"], coords["pos"], coords["ref"], coords["alt"],
+                              artifacts=artifacts)
 
 CLI:
     python predict.py 17 7674220 C T /path/to/SNV-judge
     python predict.py --vcf variants.vcf /path/to/SNV-judge --output results.csv
     python predict.py --gene TP53 --protein R175H /path/to/SNV-judge --clinvar
+    python predict.py 17 7674220 C T /path/to/SNV-judge \
+        --genos-url https://neuronic-marilynn-touristically.ngrok-free.dev
 """
 
 import argparse
@@ -61,6 +73,12 @@ VEP_HDR      = {"Content-Type": "application/json", "Accept": "application/json"
 GNOMAD_URL   = "https://gnomad.broadinstitute.org/api"
 ENSEMBL_BASE = "https://rest.ensembl.org"
 
+# ── Genos 本地端点（可选，通过 --genos-url 启用）─────────────────────────
+GENOS_DEFAULT_URL = "https://neuronic-marilynn-touristically.ngrok-free.dev"
+GENOS_FLANK       = 500   # 变异位点两侧各取 500 bp（共 1001 bp）
+GENOS_MODEL_NAME  = "10B" # 使用 Genos-10B 模型
+GENOS_TIMEOUT     = 60    # 单次 /extract 请求超时（秒）
+
 # ── ACMG 5 级分类阈值 ─────────────────────────────────────────────────────
 ACMG_TIERS = [
     (0.90, "Pathogenic (P)",         "High confidence"),
@@ -76,10 +94,11 @@ FEATURE_NAMES_V5 = ["sift_inv", "polyphen", "alphamissense", "cadd",
 FEATURE_NAMES_V4 = ["sift_inv", "polyphen", "alphamissense", "cadd",
                     "phylop", "gnomad_log_af"]
 FEATURE_LABELS_V5 = ["SIFT (inv)", "PolyPhen-2", "AlphaMissense", "CADD Phred",
-                     "Evo2 LLR*", "Genos Score*", "phyloP", "gnomAD log-AF"]
+                     "Evo2 LLR*", "Genos Score", "phyloP", "gnomAD log-AF"]
 FEATURE_LABELS_V4 = ["SIFT (inv)", "PolyPhen-2", "AlphaMissense", "CADD Phred",
                      "phyloP", "gnomAD log-AF"]
 # * 表示该特征在离线模式下使用训练集中位数填充
+# Genos Score 标签动态更新（在线时去掉 *，离线时加 *）
 
 VERSION_FEATURE_MAP = {
     "v5": (8, FEATURE_NAMES_V5, FEATURE_LABELS_V5),
@@ -95,12 +114,6 @@ def load_model_artifacts(model_dir: str = ".") -> dict:
     """
     加载 v5 模型文件，自动降级到 v4/v3/v2/v1。
     新增：验证模型特征数量与版本一致性。
-
-    Args:
-        model_dir: SNV-judge 项目根目录（含 xgb_model_v5.pkl 等文件）
-
-    Returns:
-        dict 包含 model, medians, calibrator, version, n_features, feature_names, feature_labels
     """
     base = Path(model_dir)
     for suffix, ver in [("_v5", "v5"), ("_v4", "v4"), ("_v3", "v3"), ("_v2", "v2"), ("", "v1")]:
@@ -116,7 +129,6 @@ def load_model_artifacts(model_dir: str = ".") -> dict:
         with open(cal_path, "rb") as f:
             calibrator = pickle.load(f)
 
-        # ── 特征数量验证 ──────────────────────────────────────────────────
         expected_n, feat_names, feat_labels = VERSION_FEATURE_MAP.get(
             ver, (8, FEATURE_NAMES_V5, FEATURE_LABELS_V5))
         actual_n = None
@@ -143,7 +155,7 @@ def load_model_artifacts(model_dir: str = ".") -> dict:
             "version":        ver,
             "n_features":     actual_n or expected_n,
             "feature_names":  feat_names,
-            "feature_labels": feat_labels,
+            "feature_labels": list(feat_labels),  # mutable copy for dynamic label update
         }
     raise FileNotFoundError(
         f"未找到模型文件。请确认 model_dir='{model_dir}' 下存在 xgb_model_v*.pkl 等文件。\n"
@@ -156,11 +168,7 @@ def load_model_artifacts(model_dir: str = ".") -> dict:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def fetch_vep_scores(chrom: str, pos: int, ref: str, alt: str) -> dict:
-    """
-    调用 Ensembl VEP REST API 获取：
-    SIFT · PolyPhen-2 · AlphaMissense · CADD · phyloP
-    完全免费，无需 API Key。
-    """
+    """调用 Ensembl VEP REST API 获取 SIFT/PolyPhen/AlphaMissense/CADD/phyloP。"""
     variant_str = f"{chrom} {pos} . {ref} {alt} . . ."
     payload = {
         "variants":      [variant_str],
@@ -223,16 +231,7 @@ def fetch_vep_scores(chrom: str, pos: int, ref: str, alt: str) -> dict:
 
 
 def fetch_vep_batch(variants: list) -> list:
-    """
-    批量 VEP 注释（最多 200 变异/次）。
-    比逐个调用快 10-50 倍。
-
-    Args:
-        variants: list of dict，每个含 chrom/pos/ref/alt
-
-    Returns:
-        list of VEP result dicts
-    """
+    """批量 VEP 注释（最多 200 变异/次），比逐个调用快 10-50 倍。"""
     if not variants:
         return []
     vep_strings = [
@@ -266,10 +265,7 @@ def fetch_vep_batch(variants: list) -> list:
 
 
 def fetch_gnomad_af(chrom: str, pos: int, ref: str, alt: str) -> float:
-    """
-    查询 gnomAD v4 等位基因频率（GraphQL API，免费无需 Key）。
-    返回 log10(AF + 1e-8)，缺失时返回 np.nan。
-    """
+    """查询 gnomAD v4 等位基因频率，返回 log10(AF + 1e-8)。"""
     query = """
     query V($vid: String!) {
       variant(variantId: $vid, dataset: gnomad_r4) {
@@ -307,7 +303,7 @@ def fetch_gnomad_af(chrom: str, pos: int, ref: str, alt: str) -> float:
 @lru_cache(maxsize=512)
 def fetch_genomic_context(chrom: str, pos: int, flank: int = 50) -> str:
     """
-    获取变异位点周围基因组序列（用于 Evo2 评分）。
+    获取变异位点周围基因组序列。
     使用 lru_cache 缓存，避免重复 API 调用。
 
     Args:
@@ -332,28 +328,112 @@ def fetch_genomic_context(chrom: str, pos: int, flank: int = 50) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 3. ClinVar 实时查询
+# 3. Genos-10B 本地 Embedding 评分（v5.2 新增）
 # ═══════════════════════════════════════════════════════════════════════════
 
-def fetch_clinvar_classification(chrom: str, pos: int, ref: str, alt: str) -> dict:
+def fetch_genos_embedding_score(
+    chrom: str,
+    pos: int,
+    ref: str,
+    alt: str,
+    genos_url: str = GENOS_DEFAULT_URL,
+    flank: int = GENOS_FLANK,
+) -> float:
     """
-    通过 NCBI E-utilities 查询 ClinVar 临床意义分类。
-    完全免费，无需 API Key。
+    通过本地 Genos-10B /extract 端点计算变异的 embedding 余弦距离评分。
+
+    原理（方案A）：
+      1. 从 Ensembl 获取变异位点两侧各 flank bp 的基因组上下文（共 2*flank+1 bp）
+      2. 构造 REF 序列（上下文原始序列）和 ALT 序列（中心碱基替换为 alt）
+      3. 分别调用 Genos /extract 获取 mean-pooled embedding 向量
+      4. 计算余弦距离：score = 1 - cosine_similarity(emb_ref, emb_alt)
+         - score ∈ [0, 1]，值越大表示变异对序列语义影响越大（→ 致病倾向）
+         - 与训练集 genos_score 中位数（0.676）同量纲，可直接替换
 
     Args:
-        chrom: 染色体（不含 chr 前缀，GRCh38）
-        pos:   位置（1-based）
-        ref:   参考等位基因
-        alt:   替代等位基因
+        chrom:     染色体（不含 chr 前缀，GRCh38）
+        pos:       位置（1-based）
+        ref:       参考等位基因（单碱基）
+        alt:       替代等位基因（单碱基）
+        genos_url: Genos 服务器 URL（ngrok 地址）
+        flank:     两侧各取 flank bp（默认 500）
 
     Returns:
-        dict 包含 clinvar_id, clinical_significance, review_status, conditions, last_evaluated
+        float: 余弦距离评分 ∈ [0, 1]；失败时返回 np.nan（调用方自动降级到中位数）
     """
+    # Step 1: 获取基因组上下文（复用带缓存的 fetch_genomic_context）
+    context = fetch_genomic_context(chrom, pos, flank=flank)
+    expected_len = 2 * flank + 1
+    if not context or len(context) < expected_len:
+        print(f"  ⚠️  Genos: 基因组上下文获取失败（长度 {len(context)}，期望 {expected_len}）")
+        return np.nan
+
+    # Step 2: 构造 REF / ALT 序列
+    center  = len(context) // 2
+    ref_seq = context
+    alt_seq = context[:center] + alt.upper() + context[center + 1:]
+
+    # 验证中心碱基与 ref 一致（容错：大小写不敏感）
+    actual_center = context[center].upper()
+    if actual_center != ref.upper():
+        print(f"  ⚠️  Genos: 中心碱基不匹配（期望 {ref.upper()}，实际 {actual_center}）"
+              f"，仍继续计算（可能坐标系偏移）")
+
+    # Step 3: 调用 /extract 获取 embedding
+    extract_url = f"{genos_url.rstrip('/')}/extract"
+
+    def _get_emb(sequence: str):
+        try:
+            r = requests.post(
+                extract_url,
+                json={
+                    "sequence":       sequence.upper(),
+                    "model_name":     GENOS_MODEL_NAME,
+                    "pooling_method": "mean",
+                },
+                timeout=GENOS_TIMEOUT,
+            )
+            if r.status_code == 200:
+                emb = r.json().get("result", {}).get("embedding")
+                if emb:
+                    return np.array(emb, dtype=np.float32)
+            print(f"  ⚠️  Genos /extract HTTP {r.status_code}: {r.text[:80]}")
+        except Exception as e:
+            print(f"  ⚠️  Genos /extract 请求失败: {e}")
+        return None
+
+    emb_ref = _get_emb(ref_seq)
+    emb_alt = _get_emb(alt_seq)
+
+    if emb_ref is None or emb_alt is None:
+        return np.nan
+
+    # Step 4: 余弦距离 = 1 - cosine_similarity
+    dot      = float(np.dot(emb_ref, emb_alt))
+    norm_ref = float(np.linalg.norm(emb_ref))
+    norm_alt = float(np.linalg.norm(emb_alt))
+    if norm_ref < 1e-9 or norm_alt < 1e-9:
+        return np.nan
+
+    cosine_sim  = dot / (norm_ref * norm_alt)
+    cosine_dist = 1.0 - float(np.clip(cosine_sim, -1.0, 1.0))
+    genos_score = float(np.clip(cosine_dist, 0.0, 1.0))
+
+    print(f"  ✓ Genos embedding 评分: {genos_score:.4f}  "
+          f"（cosine_dist REF↔ALT，flank={flank}bp）")
+    return genos_score
+
+
+
+# =============================================================================
+# 4. ClinVar 实时查询
+# =============================================================================
+
+def fetch_clinvar_classification(chrom: str, pos: int, ref: str, alt: str) -> dict:
+    """通过 NCBI E-utilities 查询 ClinVar 临床意义分类（免费，无需 API Key）。"""
     search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
     fetch_url  = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
-
     try:
-        # Step 1: 搜索 ClinVar ID（按染色体+位置）
         params = {
             "db":      "clinvar",
             "term":    f"{chrom}[Chromosome] AND {pos}[Base Position for Assembly GRCh38]",
@@ -362,14 +442,11 @@ def fetch_clinvar_classification(chrom: str, pos: int, ref: str, alt: str) -> di
         }
         r = requests.get(search_url, params=params, timeout=15)
         if r.status_code != 200:
-            return {"error": f"ClinVar 搜索失败: HTTP {r.status_code}"}
-
+            return {"error": f"ClinVar search failed: HTTP {r.status_code}"}
         ids = r.json().get("esearchresult", {}).get("idlist", [])
         if not ids:
             return {"clinvar_id": None, "clinical_significance": "Not in ClinVar",
                     "review_status": "", "conditions": [], "last_evaluated": ""}
-
-        # Step 2: 获取详细信息
         fetch_params = {
             "db":      "clinvar",
             "id":      ",".join(ids[:5]),
@@ -378,17 +455,15 @@ def fetch_clinvar_classification(chrom: str, pos: int, ref: str, alt: str) -> di
         }
         r2 = requests.get(fetch_url, params=fetch_params, timeout=15)
         if r2.status_code != 200:
-            return {"error": f"ClinVar 获取失败: HTTP {r2.status_code}"}
-
-        data = r2.json()
-        result_set = data.get("ClinVarResult-Set", {})
+            return {"error": f"ClinVar fetch failed: HTTP {r2.status_code}"}
+        data          = r2.json()
+        result_set    = data.get("ClinVarResult-Set", {})
         variants_list = result_set.get("VariationArchive", [])
         if isinstance(variants_list, dict):
             variants_list = [variants_list]
-
         for var in variants_list:
-            interp = var.get("InterpretedRecord", {})
-            allele = interp.get("SimpleAllele", {})
+            interp   = var.get("InterpretedRecord", {})
+            allele   = interp.get("SimpleAllele", {})
             loc_list = allele.get("Location", {}).get("SequenceLocation", [])
             if isinstance(loc_list, dict):
                 loc_list = [loc_list]
@@ -419,39 +494,23 @@ def fetch_clinvar_classification(chrom: str, pos: int, ref: str, alt: str) -> di
                         "conditions":            conds,
                         "last_evaluated":        date,
                     }
-
         return {"clinvar_id": None, "clinical_significance": "Not found at this position",
                 "review_status": "", "conditions": [], "last_evaluated": ""}
-
     except Exception as e:
-        return {"error": f"ClinVar 查询异常: {e}"}
+        return {"error": f"ClinVar query error: {e}"}
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 4. 蛋白变异名称解析
-# ═══════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# 5. 蛋白变异名称解析
+# =============================================================================
 
 def resolve_protein_variant(gene: str, protein_change: str,
                              assembly: str = "GRCh38") -> dict:
     """
     将蛋白变异名称（如 "TP53 R175H"）解析为基因组坐标。
-    使用 Ensembl HGVS REST API，完全免费。
-
-    Args:
-        gene:           基因名称（如 "TP53"、"BRCA1"）
-        protein_change: 蛋白变化（如 "R175H"、"p.Arg175His"）
-        assembly:       基因组版本（"GRCh38" 或 "GRCh37"）
-
-    Returns:
-        dict 包含 chrom, pos, ref, alt, hgvs_p, transcript, gene
-
-    Example:
-        coords = resolve_protein_variant("TP53", "R175H")
-        result = predict_variant(coords["chrom"], coords["pos"],
-                                 coords["ref"], coords["alt"], artifacts=artifacts)
+    使用 Ensembl HGVS REST API（免费，无需 Key）。
     """
     import re
-
     pc = protein_change.strip()
     if not pc.startswith("p."):
         aa_map = {
@@ -466,17 +525,14 @@ def resolve_protein_variant(gene: str, protein_change: str,
             ref_3 = aa_map.get(ref_aa, ref_aa)
             alt_3 = "Ter" if alt_aa == "*" else aa_map.get(alt_aa, alt_aa)
             pc = f"p.{ref_3}{pos_aa}{alt_3}"
-
     hdrs = {"Content-Type": "application/json", "Accept": "application/json"}
-
-    # Step 1: 获取基因的 MANE Select 转录本
     gene_url = f"{ENSEMBL_BASE}/lookup/symbol/homo_sapiens/{gene}"
     try:
         r = requests.get(gene_url, headers=hdrs, params={"expand": 1}, timeout=15)
         if r.status_code != 200:
-            return {"error": f"基因查询失败: {gene} HTTP {r.status_code}"}
-        gene_data = r.json()
-        transcripts = gene_data.get("Transcript", [])
+            return {"error": f"Gene lookup failed: {gene} HTTP {r.status_code}"}
+        gene_data     = r.json()
+        transcripts   = gene_data.get("Transcript", [])
         transcript_id = None
         for t in transcripts:
             if t.get("is_mane_select"):
@@ -490,43 +546,36 @@ def resolve_protein_variant(gene: str, protein_change: str,
         if not transcript_id and transcripts:
             transcript_id = transcripts[0]["id"]
         if not transcript_id:
-            return {"error": f"未找到 {gene} 的转录本"}
+            return {"error": f"No transcript found for {gene}"}
     except Exception as e:
-        return {"error": f"基因查询异常: {e}"}
-
-    # Step 2: HGVS 解析
+        return {"error": f"Gene lookup error: {e}"}
     hgvs_notation = f"{transcript_id}:{pc}"
-    hgvs_url = f"{ENSEMBL_BASE}/variant_recoder/homo_sapiens/{hgvs_notation}"
+    hgvs_url      = f"{ENSEMBL_BASE}/variant_recoder/homo_sapiens/{hgvs_notation}"
     try:
         r = requests.get(hgvs_url, headers=hdrs, timeout=15)
         if r.status_code != 200:
-            return {"error": f"HGVS 解析失败: {hgvs_notation} HTTP {r.status_code}"}
+            return {"error": f"HGVS resolve failed: {hgvs_notation} HTTP {r.status_code}"}
         recoder_data = r.json()
         if not recoder_data:
-            return {"error": f"HGVS 无结果: {hgvs_notation}"}
-
-        entry = recoder_data[0] if isinstance(recoder_data, list) else recoder_data
+            return {"error": f"HGVS no result: {hgvs_notation}"}
+        entry       = recoder_data[0] if isinstance(recoder_data, list) else recoder_data
         vcf_strings = []
         for key, val in entry.items():
             if isinstance(val, dict):
                 vcf_list = val.get("vcf_string", [])
                 if vcf_list:
                     vcf_strings.extend(vcf_list if isinstance(vcf_list, list) else [vcf_list])
-
         if not vcf_strings:
-            return {"error": f"无法获取 VCF 坐标: {hgvs_notation}"}
-
+            return {"error": f"No VCF coords: {hgvs_notation}"}
         vcf_str = vcf_strings[0]
-        parts = vcf_str.split("-")
+        parts   = vcf_str.split("-")
         if len(parts) < 4:
-            return {"error": f"VCF 格式异常: {vcf_str}"}
-
+            return {"error": f"Bad VCF format: {vcf_str}"}
         chrom = parts[0].replace("chr", "")
         pos   = int(parts[1])
         ref   = parts[2].upper()
         alt   = parts[3].upper()
-
-        print(f"✓ 蛋白变异解析: {gene} {protein_change} → chr{chrom}:{pos} {ref}>{alt}")
+        print(f"Resolved: {gene} {protein_change} -> chr{chrom}:{pos} {ref}>{alt}")
         return {
             "chrom":      chrom,
             "pos":        pos,
@@ -537,35 +586,24 @@ def resolve_protein_variant(gene: str, protein_change: str,
             "gene":       gene,
         }
     except Exception as e:
-        return {"error": f"HGVS 解析异常: {e}"}
+        return {"error": f"HGVS resolve error: {e}"}
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 5. VCF 文件解析
-# ═══════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# 6. VCF 文件解析
+# =============================================================================
 
 def parse_vcf(vcf_path: str) -> list:
-    """
-    解析 VCF 文件（支持普通文本和 gzip 压缩），提取 SNV 变异列表。
-
-    Args:
-        vcf_path: VCF 文件路径（.vcf 或 .vcf.gz）
-
-    Returns:
-        list of dict，每个含 chrom/pos/ref/alt
-    """
+    """解析 VCF 文件（支持普通文本和 gzip 压缩），提取 SNV 变异列表。"""
     path = Path(vcf_path)
     if not path.exists():
-        raise FileNotFoundError(f"VCF 文件不存在: {vcf_path}")
-
+        raise FileNotFoundError(f"VCF not found: {vcf_path}")
     with open(path, "rb") as f:
         raw = f.read()
-
     if raw[:2] == b"\x1f\x8b":
         text = gzip.decompress(raw).decode("utf-8", errors="replace")
     else:
         text = raw.decode("utf-8", errors="replace")
-
     variants = []
     for line in text.splitlines():
         if line.startswith("#"):
@@ -575,25 +613,20 @@ def parse_vcf(vcf_path: str) -> list:
             continue
         chrom, pos_str, _, ref, alt_field = parts[0], parts[1], parts[2], parts[3], parts[4]
         chrom = chrom.replace("chr", "")
-        alt = alt_field.split(",")[0]
+        alt   = alt_field.split(",")[0]
         if len(ref) == 1 and len(alt) == 1 and ref.upper() != alt.upper():
             try:
-                variants.append({
-                    "chrom": chrom,
-                    "pos":   int(pos_str),
-                    "ref":   ref.upper(),
-                    "alt":   alt.upper(),
-                })
+                variants.append({"chrom": chrom, "pos": int(pos_str),
+                                  "ref": ref.upper(), "alt": alt.upper()})
             except ValueError:
                 continue
-
-    print(f"✓ VCF 解析完成: {len(variants)} 个 SNV（来自 {path.name}）")
+    print(f"VCF parsed: {len(variants)} SNVs from {path.name}")
     return variants
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 6. 核心预测函数
-# ═══════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# 7. 核心预测函数
+# =============================================================================
 
 def _get_acmg_tier(prob: float) -> dict:
     for thresh, label, confidence in ACMG_TIERS:
@@ -630,22 +663,22 @@ def _extract_vep_scores_from_raw(vep_raw: dict) -> dict:
 
 def predict_from_scores(vep_scores: dict,
                          gnomad_log_af: float,
-                         artifacts: dict) -> dict:
+                         artifacts: dict,
+                         genos_url: str = None,
+                         chrom: str = None,
+                         pos: int = None,
+                         ref: str = None,
+                         alt: str = None) -> dict:
     """
-    用 VEP 评分 + gnomAD AF 直接预测（Evo2/Genos 用训练中位数填充）。
+    用 VEP 评分 + gnomAD AF 直接预测。
 
-    Args:
-        vep_scores:    fetch_vep_scores() 的返回值
-        gnomad_log_af: fetch_gnomad_af() 的返回值
-        artifacts:     load_model_artifacts() 的返回值
-
-    Returns:
-        dict 包含 cal_prob, acmg_class, shap_values, feature_vec 等
+    v5.2: genos_url 指定后调用本地 Genos /extract 计算 REF/ALT embedding 余弦距离，
+    替代 genos_score 的训练集中位数填充；服务不可用时自动降级回中位数。
     """
     model       = artifacts["model"]
     medians     = artifacts["medians"]
     calibrator  = artifacts["calibrator"]
-    feat_labels = artifacts.get("feature_labels", FEATURE_LABELS_V5)
+    feat_labels = list(artifacts.get("feature_labels", FEATURE_LABELS_V5))
     n_features  = artifacts.get("n_features", 8)
 
     def _val(key, med_key=None):
@@ -665,6 +698,23 @@ def predict_from_scores(vep_scores: dict,
     sift_score = vep_scores.get("sift_score")
     sift_inv   = (1.0 - float(sift_score)) if sift_score is not None else float(medians.get("sift_inv", 1.0))
 
+    # Genos Score: 优先用真实 embedding 评分，失败时降级到中位数
+    genos_raw    = np.nan
+    genos_source = "median imputation (no --genos-url)"
+    if n_features == 8 and genos_url and chrom and pos and ref and alt:
+        genos_raw = fetch_genos_embedding_score(chrom, pos, ref, alt, genos_url=genos_url)
+        if not np.isnan(genos_raw):
+            genos_source = "Genos embedding (cosine dist, 500bp context)"
+        else:
+            genos_source = "median imputation (Genos unavailable)"
+
+    genos_val = (genos_raw if (n_features == 8 and not np.isnan(genos_raw))
+                 else float(medians.get("genos_score", 0.676)))
+
+    # 动态更新 Genos Score 标签
+    if n_features == 8 and len(feat_labels) > 5:
+        feat_labels[5] = "Genos Score" if not np.isnan(genos_raw) else "Genos Score*"
+
     if n_features == 8:
         feature_vec = [
             sift_inv,
@@ -672,7 +722,7 @@ def predict_from_scores(vep_scores: dict,
             _val("am_pathogenicity", "alphamissense"),
             _val("cadd_phred", "cadd"),
             float(medians.get("evo2_llr", -0.074)),
-            float(medians.get("genos_score", 0.676)),
+            genos_val,
             _val("phylop", "phylop"),
             _impute(gnomad_log_af, "gnomad_log_af"),
         ]
@@ -723,146 +773,67 @@ def predict_from_scores(vep_scores: dict,
         "feature_labels":   feat_labels,
         "feature_vec":      feature_vec,
         "top_shap_feature": feat_labels[top_idx] if top_idx < len(feat_labels) else "",
-        "offline_mode":     True,
+        "genos_source":     genos_source,
+        "offline_mode":     np.isnan(genos_raw),
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 7. SHAP 瀑布图可视化
-# ═══════════════════════════════════════════════════════════════════════════
-
-def plot_shap_waterfall(result: dict,
-                         title: str = None,
-                         save_path: str = None,
-                         figsize: tuple = (9, 5)):
-    """
-    绘制 SHAP 瀑布图，展示各特征对预测结果的贡献。
-
-    Args:
-        result:    predict_variant() 或 predict_from_scores() 的返回值
-        title:     图标题（默认自动生成）
-        save_path: 保存路径（如 "shap_waterfall.svg"），None 则不保存
-        figsize:   图形尺寸
-
-    Returns:
-        matplotlib Figure 对象
-    """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.patches as mpatches
-    import matplotlib.pyplot as plt
-
-    shap_vals = result["shap_values"]
-    labels    = result["feature_labels"]
-    cal_prob  = result["cal_prob"]
-    acmg      = result["acmg_class"]
-
-    order         = np.argsort(np.abs(shap_vals))
-    sorted_labels = [labels[i] for i in order]
-    sorted_vals   = [shap_vals[i] for i in order]
-    colors        = ["#D55E00" if v > 0 else "#0072B2" for v in sorted_vals]
-
-    fig, ax = plt.subplots(figsize=figsize)
-    bars = ax.barh(sorted_labels, sorted_vals, color=colors, edgecolor="white", height=0.6)
-
-    for bar, val in zip(bars, sorted_vals):
-        ha = "left" if val >= 0 else "right"
-        x  = val + (0.002 if val >= 0 else -0.002)
-        ax.text(x, bar.get_y() + bar.get_height() / 2,
-                f"{val:+.4f}", va="center", ha=ha, fontsize=9)
-
-    ax.axvline(0, color="black", linewidth=0.8)
-    ax.set_xlabel("SHAP value (contribution to pathogenicity log-odds)", fontsize=9)
-
-    if title is None:
-        chrom = result.get("chrom", "?")
-        pos   = result.get("pos", "?")
-        ref   = result.get("ref", "?")
-        alt   = result.get("alt", "?")
-        gene  = result.get("gene", "")
-        hgvsp = result.get("hgvsp", "")
-        title = (f"SHAP Feature Contributions\n"
-                 f"chr{chrom}:{pos} {ref}>{alt}"
-                 + (f"  {gene} {hgvsp}" if gene else "")
-                 + f"\nPrediction: {cal_prob:.1%}  →  {acmg}")
-    ax.set_title(title, fontsize=10, fontweight="bold")
-
-    red_patch  = mpatches.Patch(color="#D55E00", label="→ Pathogenic")
-    blue_patch = mpatches.Patch(color="#0072B2", label="→ Benign")
-    ax.legend(handles=[red_patch, blue_patch], fontsize=8, loc="lower right")
-    plt.tight_layout()
-
-    if save_path:
-        fig.savefig(save_path, dpi=150, bbox_inches="tight")
-        print(f"✓ SHAP 瀑布图已保存: {save_path}")
-
-    return fig
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 8. 高层接口（推荐使用）
-# ═══════════════════════════════════════════════════════════════════════════
-
 def predict_variant(chrom: str, pos: int, ref: str, alt: str,
-                     artifacts: dict = None,
-                     model_dir: str = ".") -> dict:
+                    artifacts: dict = None,
+                    model_dir: str = ".",
+                    genos_url: str = None,
+                    include_clinvar: bool = False) -> dict:
     """
-    完整预测流程：VEP + gnomAD → 模型预测 → ACMG 分级 + SHAP。
-    无需 Evo2 / Genos API Key。
+    单变异预测主函数。
 
     Args:
-        chrom:     染色体（如 "17"，不含 "chr" 前缀，GRCh38）
-        pos:       位置（1-based）
-        ref:       参考等位基因（单碱基）
-        alt:       替代等位基因（单碱基）
-        artifacts: load_model_artifacts() 的返回值（可复用，避免重复加载）
-        model_dir: 模型文件目录（artifacts 为 None 时使用）
+        chrom:           染色体（不含 chr 前缀）
+        pos:             位置（1-based，GRCh38）
+        ref:             参考等位基因
+        alt:             替代等位基因
+        artifacts:       load_model_artifacts() 返回的字典（可复用）
+        model_dir:       模型目录（artifacts 为 None 时使用）
+        genos_url:       Genos 本地服务器 URL（v5.2 新增，可选）
+        include_clinvar: 是否查询 ClinVar（默认 False）
 
     Returns:
-        dict 包含 cal_prob, acmg_class, acmg_confidence, shap_values,
-                  top_shap_feature, gene, hgvsp, feature_vec, offline_mode
+        dict: 包含 cal_prob, acmg_class, shap_values, vep_scores, gnomad_log_af 等
     """
-    chrom = str(chrom).replace("chr", "")
-    ref, alt = ref.upper().strip(), alt.upper().strip()
-
     if artifacts is None:
         artifacts = load_model_artifacts(model_dir)
 
-    print(f"正在获取 {chrom}:{pos} {ref}>{alt} 的注释信息...")
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        fut_vep    = ex.submit(fetch_vep_scores, chrom, pos, ref, alt)
-        fut_gnomad = ex.submit(fetch_gnomad_af,  chrom, pos, ref, alt)
-        vep_scores    = fut_vep.result()
-        gnomad_log_af = fut_gnomad.result()
+    chrom = str(chrom).replace("chr", "")
+    pos   = int(pos)
+    ref   = ref.upper()
+    alt   = alt.upper()
+
+    print(f"\nPredicting: chr{chrom}:{pos} {ref}>{alt}")
+
+    # 并行获取 VEP 和 gnomAD
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        vep_future    = pool.submit(fetch_vep_scores, chrom, pos, ref, alt)
+        gnomad_future = pool.submit(fetch_gnomad_af,  chrom, pos, ref, alt)
+    vep_scores    = vep_future.result()
+    gnomad_log_af = gnomad_future.result()
 
     if "error" in vep_scores:
-        raise RuntimeError(f"VEP 注释失败: {vep_scores['error']}")
+        print(f"  VEP warning: {vep_scores['error']}")
 
-    if vep_scores.get("warning"):
-        print(f"⚠️  {vep_scores['warning']}")
-
-    result = predict_from_scores(vep_scores, gnomad_log_af, artifacts)
+    result = predict_from_scores(
+        vep_scores, gnomad_log_af, artifacts,
+        genos_url=genos_url, chrom=chrom, pos=pos, ref=ref, alt=alt
+    )
     result.update({
         "chrom":         chrom,
         "pos":           pos,
         "ref":           ref,
         "alt":           alt,
-        "gene":          vep_scores.get("gene", ""),
-        "transcript":    vep_scores.get("transcript", ""),
-        "hgvsp":         vep_scores.get("hgvsp", ""),
-        "consequence":   vep_scores.get("consequence", ""),
-        "am_class":      vep_scores.get("am_class", ""),
-        "sift_pred":     vep_scores.get("sift_pred", ""),
+        "vep_scores":    vep_scores,
         "gnomad_log_af": gnomad_log_af,
     })
 
-    print(f"\n{'='*55}")
-    print(f"变异: chr{chrom}:{pos} {ref}>{alt}")
-    print(f"基因: {result['gene']}  蛋白变化: {result['hgvsp']}")
-    print(f"致病概率: {result['cal_prob']:.1%}  →  {result['acmg_class']} ({result['acmg_confidence']})")
-    print(f"主要贡献特征: {result['top_shap_feature']}")
-    print(f"注: Evo2 LLR 和 Genos Score 使用训练集中位数填充（离线模式）")
-    print(f"{'='*55}")
+    if include_clinvar:
+        result["clinvar"] = fetch_clinvar_classification(chrom, pos, ref, alt)
 
     return result
 
@@ -870,246 +841,323 @@ def predict_variant(chrom: str, pos: int, ref: str, alt: str,
 def predict_vcf(vcf_path: str,
                 artifacts: dict = None,
                 model_dir: str = ".",
+                genos_url: str = None,
                 output_csv: str = None,
-                batch_size: int = 50,
-                verbose: bool = True) -> list:
+                batch_size: int = 200) -> list:
     """
     批量预测 VCF 文件中的所有 SNV。
-    使用批量 VEP 注释（最多 batch_size 变异/次），效率远高于逐个预测。
 
     Args:
-        vcf_path:   VCF 文件路径（.vcf 或 .vcf.gz）
-        artifacts:  load_model_artifacts() 的返回值
-        model_dir:  模型文件目录（artifacts 为 None 时使用）
-        output_csv: 结果 CSV 保存路径（None 则不保存）
-        batch_size: 每批 VEP 注释的变异数量（最大 200）
-        verbose:    是否打印进度
+        vcf_path:   VCF 文件路径（支持 .vcf 和 .vcf.gz）
+        artifacts:  load_model_artifacts() 返回的字典
+        model_dir:  模型目录（artifacts 为 None 时使用）
+        genos_url:  Genos 本地服务器 URL（可选）
+        output_csv: 输出 CSV 文件路径（可选）
+        batch_size: VEP 批量注释大小（最大 200）
 
     Returns:
-        list of dict，每个含完整预测结果
+        list of dicts: 每个变异的预测结果
     """
     if artifacts is None:
         artifacts = load_model_artifacts(model_dir)
 
     variants = parse_vcf(vcf_path)
     if not variants:
-        print("⚠️  VCF 文件中未找到有效 SNV")
+        print("No SNVs found in VCF.")
         return []
 
-    total = len(variants)
-    if verbose:
-        print(f"开始批量预测 {total} 个变异（批大小: {batch_size}）...")
-
-    # Step 1: 批量 VEP 注释
-    vep_map = {}
-    for i in range(0, total, batch_size):
-        batch = variants[i: i + batch_size]
-        if verbose:
-            print(f"  VEP 批量注释: {min(i+batch_size, total)}/{total}")
-        raw_results = fetch_vep_batch(batch)
-        for res in raw_results:
-            parts = res.get("input", "").split()
-            if len(parts) >= 5:
-                key = (parts[0], int(parts[1]), parts[3], parts[4])
-                vep_map[key] = res
-        if i + batch_size < total:
-            time.sleep(0.5)
-
-    # Step 2: 并行获取 gnomAD AF + 预测
-    def process_one(v):
-        key        = (v["chrom"], v["pos"], v["ref"], v["alt"])
-        vep_raw    = vep_map.get(key, {})
-        vep_scores = _extract_vep_scores_from_raw(vep_raw) if vep_raw else {}
-        gnomad_log_af = fetch_gnomad_af(v["chrom"], v["pos"], v["ref"], v["alt"])
-        pred = predict_from_scores(vep_scores, gnomad_log_af, artifacts)
-        pred.update({
-            "chrom":         v["chrom"],
-            "pos":           v["pos"],
-            "ref":           v["ref"],
-            "alt":           v["alt"],
-            "gene":          vep_scores.get("gene", ""),
-            "hgvsp":         vep_scores.get("hgvsp", ""),
-            "consequence":   vep_scores.get("consequence", ""),
-            "gnomad_log_af": gnomad_log_af,
-        })
-        return pred
-
+    print(f"\nBatch predicting {len(variants)} variants...")
     results = []
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        futures = [ex.submit(process_one, v) for v in variants]
-        for i, fut in enumerate(futures):
-            try:
-                results.append(fut.result())
-            except Exception as e:
-                v = variants[i]
-                results.append({
-                    "chrom": v["chrom"], "pos": v["pos"],
-                    "ref": v["ref"], "alt": v["alt"],
-                    "error": str(e), "cal_prob": None, "acmg_class": "Error",
-                })
-            if verbose and (i + 1) % 10 == 0:
-                print(f"  预测进度: {i+1}/{total}")
+
+    for batch_start in range(0, len(variants), batch_size):
+        batch = variants[batch_start:batch_start + batch_size]
+        print(f"  VEP batch {batch_start+1}-{batch_start+len(batch)} / {len(variants)}...")
+
+        vep_batch_raw = fetch_vep_batch(batch)
+        vep_map = {}
+        for vr in vep_batch_raw:
+            inp = vr.get("input", "")
+            parts = inp.split()
+            if len(parts) >= 5:
+                key = (parts[0], int(parts[1]), parts[3].upper(), parts[4].upper())
+                vep_map[key] = _extract_vep_scores_from_raw(vr)
+
+        for v in batch:
+            key           = (v["chrom"], v["pos"], v["ref"], v["alt"])
+            vep_scores    = vep_map.get(key, {})
+            gnomad_log_af = fetch_gnomad_af(v["chrom"], v["pos"], v["ref"], v["alt"])
+            pred = predict_from_scores(
+                vep_scores, gnomad_log_af, artifacts,
+                genos_url=genos_url,
+                chrom=v["chrom"], pos=v["pos"], ref=v["ref"], alt=v["alt"]
+            )
+            pred.update({"chrom": v["chrom"], "pos": v["pos"],
+                          "ref": v["ref"], "alt": v["alt"],
+                          "gene": vep_scores.get("gene", ""),
+                          "hgvsp": vep_scores.get("hgvsp", ""),
+                          "consequence": vep_scores.get("consequence", "")})
+            results.append(pred)
 
     if output_csv:
-        save_results_csv(results, output_csv)
+        _write_csv(results, output_csv)
 
-    if verbose:
-        print(f"\n✓ 批量预测完成: {len(results)} 个变异")
-        pathogenic = sum(1 for r in results
-                         if r.get("acmg_class", "").startswith(("Pathogenic", "Likely Pathogenic")))
-        vus_count  = sum(1 for r in results if r.get("acmg_class") == "VUS")
-        print(f"  致病/可能致病: {pathogenic}  VUS: {vus_count}")
-
+    print(f"\nDone: {len(results)} variants predicted.")
     return results
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 9. CSV 输出
-# ═══════════════════════════════════════════════════════════════════════════
-
-def save_results_csv(results: list, output_path: str):
-    """
-    将预测结果列表保存为 CSV 文件。
-
-    Args:
-        results:     predict_variant() 或 predict_vcf() 的返回值列表
-        output_path: CSV 文件保存路径
-    """
+def _write_csv(results: list, output_path: str):
+    """将预测结果写入 CSV 文件。"""
     if not results:
-        print("⚠️  无结果可保存")
         return
-
-    fieldnames = [
-        "chrom", "pos", "ref", "alt",
-        "gene", "hgvsp", "consequence",
-        "cal_prob", "acmg_class", "acmg_confidence",
-        "top_shap_feature", "gnomad_log_af",
-        "offline_mode", "error",
-    ]
-
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["chrom", "pos", "ref", "alt", "gene", "hgvsp", "consequence",
+                  "cal_prob", "raw_prob", "acmg_class", "acmg_confidence",
+                  "top_shap_feature", "genos_source", "offline_mode"]
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
-        for r in results:
-            row = {k: r.get(k, "") for k in fieldnames}
-            if row.get("cal_prob") is not None:
-                try:
-                    row["cal_prob"] = f"{float(row['cal_prob']):.4f}"
-                except (TypeError, ValueError):
-                    pass
-            writer.writerow(row)
-
-    print(f"✓ 结果已保存: {output_path}  ({len(results)} 行)")
+        writer.writerows(results)
+    print(f"Results saved to: {output_path}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 10. 辅助打印函数
-# ═══════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# 8. SHAP 瀑布图可视化
+# =============================================================================
 
-def print_shap_summary(result: dict):
-    """打印 SHAP 特征贡献摘要（文本版）。"""
-    print("\nSHAP 特征贡献（正值→致病，负值→良性）:")
-    pairs = sorted(zip(result["feature_labels"], result["shap_values"]),
-                   key=lambda x: abs(x[1]), reverse=True)
-    for label, sv in pairs:
-        bar       = "█" * int(abs(sv) * 30)
-        direction = "→致病" if sv > 0 else "→良性"
-        offline   = " [中位数填充]" if "*" in label else ""
-        print(f"  {label:<18} {sv:+.4f} {direction}  {bar}{offline}")
+def plot_shap_waterfall(result: dict, save_path: str = None):
+    """
+    绘制单变异 SHAP 瀑布图。
 
+    Args:
+        result:    predict_variant() 返回的字典
+        save_path: 图片保存路径（None 则直接显示）
+    """
+    try:
+        import shap
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("shap / matplotlib not installed. pip install shap matplotlib")
+        return
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 11. CLI 入口
-# ═══════════════════════════════════════════════════════════════════════════
+    shap_vals   = result.get("shap_values", [])
+    feat_labels = result.get("feature_labels", [])
+    feat_vec    = result.get("feature_vec", [])
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="SNV-judge v5 — 变异致病性预测",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-示例:
-  # 单变异预测
-  python predict.py 17 7674220 C T /path/to/SNV-judge
+    if not shap_vals:
+        print("No SHAP values in result.")
+        return
 
-  # VCF 批量预测
-  python predict.py --vcf variants.vcf /path/to/SNV-judge --output results.csv
+    n = min(len(shap_vals), len(feat_labels), len(feat_vec))
+    shap_vals   = shap_vals[:n]
+    feat_labels = feat_labels[:n]
+    feat_vec    = feat_vec[:n]
 
-  # 蛋白变异名称解析后预测
-  python predict.py --gene TP53 --protein R175H /path/to/SNV-judge
-
-  # 附带 ClinVar 查询 + SHAP 图
-  python predict.py 17 7674220 C T /path/to/SNV-judge --clinvar --shap shap.svg
-        """
+    base_val = result.get("raw_prob", 0.5)
+    expl = shap.Explanation(
+        values=np.array(shap_vals),
+        base_values=base_val,
+        data=np.array(feat_vec),
+        feature_names=feat_labels,
     )
 
-    parser.add_argument("chrom",     nargs="?", help="染色体（如 17）")
-    parser.add_argument("pos",       nargs="?", type=int, help="位置（1-based）")
-    parser.add_argument("ref",       nargs="?", help="参考等位基因")
-    parser.add_argument("alt",       nargs="?", help="替代等位基因")
-    parser.add_argument("model_dir", nargs="?", default=".", help="模型文件目录")
+    fig, ax = plt.subplots(figsize=(9, 5))
+    shap.plots.waterfall(expl, show=False)
 
-    parser.add_argument("--vcf",        help="VCF 文件路径（批量预测模式）")
-    parser.add_argument("--gene",       help="基因名称（蛋白变异解析模式）")
-    parser.add_argument("--protein",    help="蛋白变化（如 R175H）")
-    parser.add_argument("--output",     help="CSV 输出文件路径")
-    parser.add_argument("--shap",       help="SHAP 瀑布图保存路径（如 shap.svg）")
-    parser.add_argument("--clinvar",    action="store_true", help="同时查询 ClinVar 分类")
-    parser.add_argument("--batch-size", type=int, default=50,
-                        help="VCF 批量 VEP 大小（默认 50，最大 200）")
+    chrom = result.get("chrom", "")
+    pos   = result.get("pos", "")
+    ref   = result.get("ref", "")
+    alt   = result.get("alt", "")
+    prob  = result.get("cal_prob", 0.0)
+    acmg  = result.get("acmg_class", "")
+    plt.title(f"chr{chrom}:{pos} {ref}>{alt}  |  P(path)={prob:.3f}  |  {acmg}",
+              fontsize=11, pad=10)
+    plt.tight_layout()
 
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"SHAP waterfall saved: {save_path}")
+    else:
+        plt.show()
+    plt.close()
+
+
+# =============================================================================
+# 9. 结果格式化打印
+# =============================================================================
+
+def print_result(result: dict):
+    """格式化打印单变异预测结果。"""
+    chrom = result.get("chrom", "?")
+    pos   = result.get("pos", "?")
+    ref   = result.get("ref", "?")
+    alt   = result.get("alt", "?")
+    vs    = result.get("vep_scores", {})
+
+    print("\n" + "=" * 60)
+    print(f"  Variant : chr{chrom}:{pos} {ref}>{alt}")
+    if vs.get("gene"):
+        print(f"  Gene    : {vs['gene']}  ({vs.get('transcript', '')})")
+    if vs.get("hgvsp"):
+        print(f"  HGVSp   : {vs['hgvsp']}")
+    if vs.get("consequence"):
+        print(f"  Conseq  : {vs['consequence']}")
+    if vs.get("warning"):
+        print(f"  WARNING : {vs['warning']}")
+    print("-" * 60)
+    print(f"  P(path) : {result['cal_prob']:.4f}  (raw: {result['raw_prob']:.4f})")
+    print(f"  ACMG    : {result['acmg_class']}  [{result['acmg_confidence']}]")
+    print(f"  Top feat: {result.get('top_shap_feature', '')}")
+    print(f"  Genos   : {result.get('genos_source', '')}")
+    print("-" * 60)
+    print("  Feature scores:")
+    for lbl, val, sv in zip(result["feature_labels"],
+                             result["feature_vec"],
+                             result["shap_values"]):
+        bar = "+" * int(abs(sv) * 20) if sv >= 0 else "-" * int(abs(sv) * 20)
+        print(f"    {lbl:<22} {val:>8.4f}   SHAP {sv:+.4f}  {bar}")
+    if "clinvar" in result:
+        cv = result["clinvar"]
+        print("-" * 60)
+        print(f"  ClinVar : {cv.get('clinical_significance', 'N/A')}")
+        if cv.get("conditions"):
+            print(f"  Cond.   : {', '.join(cv['conditions'][:3])}")
+        if cv.get("review_status"):
+            print(f"  Review  : {cv['review_status']}")
+    print("=" * 60)
+
+
+# =============================================================================
+# 10. CLI 入口
+# =============================================================================
+
+def print_shap_summary(result: dict):
+    """
+    打印单变异 SHAP 贡献简洁摘要（无需 matplotlib）。
+
+    与 SKILL.md 快速开始示例一致：
+        result = predict_variant("17", 7674220, "C", "T", artifacts=artifacts)
+        print_shap_summary(result)
+
+    输出示例：
+        SHAP Feature Contributions
+        ──────────────────────────────────────────
+        AlphaMissense      0.8120   SHAP +0.312  ▲ pathogenic
+        CADD Phred        28.4000   SHAP +0.198  ▲ pathogenic
+        gnomAD log-AF     -7.9000   SHAP +0.143  ▲ pathogenic
+        PolyPhen-2         0.9900   SHAP +0.089  ▲ pathogenic
+        SIFT (inv)         0.9800   SHAP +0.071  ▲ pathogenic
+        phyloP             2.1000   SHAP +0.044  ▲ pathogenic
+        Genos Score*       0.6760   SHAP -0.012  ▼ benign
+        Evo2 LLR*         -0.0740   SHAP -0.008  ▼ benign
+        ──────────────────────────────────────────
+        Top driver: AlphaMissense  (SHAP +0.312)
+    """
+    shap_vals   = result.get("shap_values", [])
+    feat_labels = result.get("feature_labels", [])
+    feat_vec    = result.get("feature_vec", [])
+
+    if not shap_vals:
+        print("No SHAP values available in result.")
+        return
+
+    n = min(len(shap_vals), len(feat_labels), len(feat_vec))
+    triples = list(zip(feat_labels[:n], feat_vec[:n], shap_vals[:n]))
+    # Sort by |SHAP| descending
+    triples.sort(key=lambda x: abs(x[2]), reverse=True)
+
+    print("\nSHAP Feature Contributions")
+    print("─" * 50)
+    for label, val, sv in triples:
+        direction = "▲ pathogenic" if sv >= 0 else "▼ benign"
+        print(f"  {label:<22} {val:>8.4f}   SHAP {sv:+.3f}  {direction}")
+    print("─" * 50)
+
+    top_label, _, top_sv = triples[0]
+    print(f"  Top driver: {top_label}  (SHAP {top_sv:+.3f})")
+    print(f"  Calibrated P(pathogenic): {result.get('cal_prob', float('nan')):.1%}")
+    print(f"  ACMG class: {result.get('acmg_class', 'N/A')}")
+    if not result.get("offline_mode", True):
+        print(f"  Genos source: {result.get('genos_source', '')}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="SNV-judge v5.2 — Offline Variant Pathogenicity Predictor",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Single variant (positional args)
+  python predict.py 17 7674220 C T /path/to/SNV-judge
+
+  # Single variant with Genos embedding scoring
+  python predict.py 17 7674220 C T /path/to/SNV-judge \
+      --genos-url https://xxx.ngrok-free.dev
+
+  # Protein variant shorthand
+  python predict.py --gene TP53 --protein R175H /path/to/SNV-judge --clinvar
+
+  # Batch VCF prediction
+  python predict.py --vcf variants.vcf /path/to/SNV-judge --output results.csv
+        """,
+    )
+    parser.add_argument("chrom",      nargs="?", help="Chromosome (no chr prefix)")
+    parser.add_argument("pos",        nargs="?", type=int, help="Position (1-based, GRCh38)")
+    parser.add_argument("ref",        nargs="?", help="Reference allele")
+    parser.add_argument("alt",        nargs="?", help="Alternate allele")
+    parser.add_argument("model_dir",  nargs="?", default=".", help="Model directory")
+    parser.add_argument("--vcf",      help="Input VCF file for batch prediction")
+    parser.add_argument("--gene",     help="Gene symbol (for protein variant mode)")
+    parser.add_argument("--protein",  help="Protein change (e.g. R175H or p.Arg175His)")
+    parser.add_argument("--clinvar",  action="store_true", help="Query ClinVar")
+    parser.add_argument("--output",   help="Output CSV path (batch mode)")
+    parser.add_argument("--shap",     help="Save SHAP waterfall plot to this path")
+    parser.add_argument("--genos-url", dest="genos_url", default=None,
+                        help="Local Genos server URL (e.g. https://xxx.ngrok-free.dev)")
     args = parser.parse_args()
 
-    # ── 模式 1: VCF 批量预测 ──────────────────────────────────────────────
-    if args.vcf:
-        model_dir = args.model_dir or "."
-        artifacts = load_model_artifacts(model_dir)
-        results   = predict_vcf(args.vcf, artifacts=artifacts,
-                                 output_csv=args.output,
-                                 batch_size=args.batch_size)
-        if not args.output:
-            print("\n前 5 个结果:")
-            for r in results[:5]:
-                prob_str = f"{r['cal_prob']:.1%}" if r.get("cal_prob") is not None else "N/A"
-                print(f"  chr{r['chrom']}:{r['pos']} {r['ref']}>{r['alt']}  "
-                      f"{r.get('gene','')}  {prob_str}  {r.get('acmg_class','')}")
+    artifacts = load_model_artifacts(args.model_dir)
 
-    # ── 模式 2: 蛋白变异名称解析 ─────────────────────────────────────────
-    elif args.gene and args.protein:
+    # --- 蛋白变异模式 ---
+    if args.gene and args.protein:
         coords = resolve_protein_variant(args.gene, args.protein)
         if "error" in coords:
-            print(f"❌ 解析失败: {coords['error']}")
-            import sys; sys.exit(1)
-        model_dir = args.model_dir or "."
-        artifacts = load_model_artifacts(model_dir)
-        result    = predict_variant(coords["chrom"], coords["pos"],
-                                     coords["ref"], coords["alt"],
-                                     artifacts=artifacts)
-        print_shap_summary(result)
+            print(f"Error: {coords['error']}")
+            return
+        result = predict_variant(
+            coords["chrom"], coords["pos"], coords["ref"], coords["alt"],
+            artifacts=artifacts,
+            genos_url=args.genos_url,
+            include_clinvar=args.clinvar,
+        )
+        print_result(result)
         if args.shap:
             plot_shap_waterfall(result, save_path=args.shap)
-        if args.clinvar:
-            cv = fetch_clinvar_classification(coords["chrom"], coords["pos"],
-                                              coords["ref"], coords["alt"])
-            print(f"\nClinVar: {cv.get('clinical_significance', 'N/A')}  "
-                  f"({cv.get('review_status', '')})")
-        if args.output:
-            save_results_csv([result], args.output)
+        return
 
-    # ── 模式 3: 单变异预测（位置参数）────────────────────────────────────
-    elif args.chrom and args.pos and args.ref and args.alt:
-        artifacts = load_model_artifacts(args.model_dir)
-        result    = predict_variant(args.chrom, args.pos, args.ref, args.alt,
-                                     artifacts=artifacts)
-        print_shap_summary(result)
-        if args.shap:
-            plot_shap_waterfall(result, save_path=args.shap)
-        if args.clinvar:
-            cv = fetch_clinvar_classification(args.chrom, args.pos, args.ref, args.alt)
-            print(f"\nClinVar: {cv.get('clinical_significance', 'N/A')}  "
-                  f"({cv.get('review_status', '')})")
-        if args.output:
-            save_results_csv([result], args.output)
+    # --- VCF 批量模式 ---
+    if args.vcf:
+        predict_vcf(
+            args.vcf,
+            artifacts=artifacts,
+            genos_url=args.genos_url,
+            output_csv=args.output,
+        )
+        return
 
-    else:
+    # --- 单变异模式 ---
+    if not all([args.chrom, args.pos, args.ref, args.alt]):
         parser.print_help()
+        return
+
+    result = predict_variant(
+        args.chrom, args.pos, args.ref, args.alt,
+        artifacts=artifacts,
+        genos_url=args.genos_url,
+        include_clinvar=args.clinvar,
+    )
+    print_result(result)
+    if args.shap:
+        plot_shap_waterfall(result, save_path=args.shap)
+
+
+if __name__ == "__main__":
+    main()

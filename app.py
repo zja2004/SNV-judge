@@ -43,7 +43,7 @@ import streamlit as st
 
 # ── Page config ───────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="SNV Pathogenicity Predictor v4",
+    page_title="SNV Pathogenicity Predictor v5",
     page_icon="🧬",
     layout="wide",
 )
@@ -57,6 +57,17 @@ KIMI_API_KEY  = os.environ.get("KIMI_API_KEY", "")
 import kimi_report as _kimi_mod
 if KIMI_API_KEY:
     _kimi_mod.KIMI_API_KEY = KIMI_API_KEY
+
+# ── Genos-10B local embedding scoring (v5.2, optional) ────────────────────
+# Import fetch_genos_embedding_score from the offline predict script.
+# Used when GENOS_API_KEY is absent but a local ngrok endpoint is provided.
+try:
+    import sys as _sys
+    _sys.path.insert(0, str(BASE / "skill"))
+    from scripts.predict import fetch_genos_embedding_score as _fetch_genos_emb
+    _GENOS_EMB_AVAILABLE = True
+except Exception:
+    _GENOS_EMB_AVAILABLE = False
 EVO2_URL    = "https://health.api.nvidia.com/v1/biology/arc/evo2-40b/generate"
 GENOS_URL   = "https://cloud.stomics.tech/api/aigateway/genos/variant_predict"
 GNOMAD_URL  = "https://gnomad.broadinstitute.org/api"
@@ -342,24 +353,46 @@ def genos_score_variant(chrom: str, pos: int, ref: str, alt: str) -> dict:
 
 def fetch_ai_scores(chrom: str, pos: int, ref: str, alt: str) -> tuple[float, float, float]:
     """Fetch Evo2 LLR, Genos score, and gnomAD log-AF in parallel.
-    Returns (evo2_llr, genos_path, gnomad_log_af)."""
+    Returns (evo2_llr, genos_path, gnomad_log_af).
+
+    Genos scoring priority (v5.2):
+      1. Stomics Cloud API  — if GENOS_API_KEY is set
+      2. Local embedding    — if genos_embed_url is set in session_state (ngrok)
+      3. Training median    — fallback (imputed in predict())
+    """
     evo2_llr      = np.nan
     genos_path    = np.nan
     gnomad_log_af = np.nan
 
+    # Determine Genos scoring mode
+    genos_embed_url = st.session_state.get("genos_embed_url", "").strip()
+    use_embedding   = (not GENOS_API_KEY and genos_embed_url
+                       and _GENOS_EMB_AVAILABLE)
+
     with ThreadPoolExecutor(max_workers=3) as ex:
-        fut_genos  = ex.submit(genos_score_variant, chrom, pos, ref, alt)
         fut_gnomad = ex.submit(fetch_gnomad_af, chrom, pos, ref, alt)
         fut_seq    = ex.submit(fetch_sequence_context, chrom, pos, 50)
 
-        genos_result  = fut_genos.result()
-        genos_path    = genos_result.get("genos_path", np.nan)
+        if use_embedding:
+            # Local Genos-10B embedding: cosine distance REF↔ALT (500bp context)
+            fut_genos = ex.submit(
+                _fetch_genos_emb, chrom, pos, ref, alt, genos_embed_url
+            )
+        else:
+            fut_genos = ex.submit(genos_score_variant, chrom, pos, ref, alt)
+
         gnomad_log_af = fut_gnomad.result()
+
+        if use_embedding:
+            genos_path = fut_genos.result()   # float (cosine dist) or np.nan
+        else:
+            genos_result = fut_genos.result()
+            genos_path   = genos_result.get("genos_path", np.nan)
 
         seq = fut_seq.result()
         if seq and len(seq) == 101 and EVO2_API_KEY:
-            ref_ctx = seq
-            alt_ctx = seq[:50] + alt + seq[51:]
+            ref_ctx  = seq
+            alt_ctx  = seq[:50] + alt + seq[51:]
             evo2_llr = evo2_score_variant(ref_ctx, alt_ctx)
 
     return evo2_llr, genos_path, gnomad_log_af
@@ -479,8 +512,12 @@ def make_gauge(prob: float) -> plt.Figure:
     return fig
 
 def make_score_bars(scores: dict, evo2_llr: float, genos_path: float,
-                    gnomad_log_af: float = np.nan) -> plt.Figure:
-    feat_labels = FEATURE_LABELS if MODEL_VER in ("v2", "v3", "v4") else FEATURE_LABELS[:4]
+                    gnomad_log_af: float = np.nan,
+                    genos_label: str = "Genos Score") -> plt.Figure:
+    # Dynamic Genos label: show source in parentheses
+    feat_labels = list(FEATURE_LABELS) if MODEL_VER in ("v2", "v3", "v4") else list(FEATURE_LABELS[:4])
+    if MODEL_VER in ("v2", "v3", "v4") and len(feat_labels) > 5:
+        feat_labels[5] = genos_label
     sift_inv = (1.0 - scores["sift_score"]) if scores.get("sift_score") is not None else None
     vals  = [sift_inv, scores.get("polyphen_score"),
              scores.get("am_pathogenicity"), scores.get("cadd_phred")]
@@ -744,6 +781,21 @@ with st.expander("📊 Model Info & Calibration Curve", expanded=False):
     if _val_fig_path.exists():
         st.image(str(_val_fig_path), caption="Independent Holdout Validation (n=300)",
                  use_container_width=True)
+    # LOGO-CV generalization figure
+    _logo_fig_path = BASE / "figures" / "fig_logo_cv.png"
+    if _logo_fig_path.exists():
+        st.divider()
+        st.markdown("**Generalization — Leave-One-Gene-Out CV (LOGO-CV)**")
+        st.image(str(_logo_fig_path),
+                 caption=(
+                     "LOGO-CV across 16 disease gene families. Each gene's variants are held out "
+                     "and a fresh stacking model is trained on all remaining genes. "
+                     "Note: each gene has only 20–21 variants (10P/10B), so AUROC estimates "
+                     "carry wide confidence intervals — especially for genes with AUROC = 1.00. "
+                     "MYH7 (AUROC = 0.79) is a known weak point due to its gain-of-function "
+                     "mechanism and atypical SIFT/PolyPhen score distribution."
+                 ),
+                 use_container_width=True)
 
 st.divider()
 
@@ -846,10 +898,20 @@ with tab_single:
 
         with col2:
             st.subheader("Sub-model Scores")
-            st.pyplot(make_score_bars(scores, evo2_llr, genos_path, gnomad_log_af),
+            # Dynamic Genos label: show scoring source
+            _embed_url_sv = st.session_state.get("genos_embed_url", "").strip()
+            if GENOS_API_KEY:
+                _genos_lbl = "Genos Score (API)"
+            elif _embed_url_sv and _GENOS_EMB_AVAILABLE and not (isinstance(genos_path, float) and np.isnan(genos_path)):
+                _genos_lbl = "Genos Score (embedding)"
+            else:
+                _genos_lbl = "Genos Score*"
+            st.pyplot(make_score_bars(scores, evo2_llr, genos_path, gnomad_log_af,
+                                      genos_label=_genos_lbl),
                       use_container_width=True)
             st.caption("Dashed line = pathogenicity threshold. N/A = score unavailable; "
-                       "training median imputed for prediction.")
+                       "training median imputed for prediction. "
+                       "\\* = Genos Score imputed with training median (0.676).")
 
         with col3:
             st.subheader("SHAP Feature Contributions")
@@ -1244,7 +1306,9 @@ with tab_report:
     st.divider()
 
     # ── API key input (sidebar override) ─────────────────────────────────
-    with st.expander("⚙️ Kimi API 设置", expanded=not bool(KIMI_API_KEY)):
+    _cfg_col1, _cfg_col2 = st.columns(2)
+
+    with _cfg_col1.expander("⚙️ Kimi API 设置", expanded=not bool(KIMI_API_KEY)):
         kimi_key_input = st.text_input(
             "Kimi API Key",
             value=KIMI_API_KEY,
@@ -1262,6 +1326,38 @@ with tab_report:
                 st.success(msg)
             else:
                 st.error(msg)
+
+    with _cfg_col2.expander("⚙️ Genos Embedding 设置 (v5.2)", expanded=False):
+        st.markdown(
+            "**本地 Genos-10B embedding 评分**  \n"
+            "无需 Stomics Cloud API Key。通过本地 ngrok 端点计算 REF/ALT 序列余弦距离，"
+            "替代 Genos Score 的训练集中位数填充。"
+        )
+        genos_url_input = st.text_input(
+            "Genos 本地服务器 URL",
+            value=st.session_state.get("genos_embed_url", ""),
+            placeholder="https://xxx.ngrok-free.dev",
+            help="启动本地 Genos-10B 服务后，将 ngrok URL 粘贴到此处。"
+                 "服务不可用时自动降级回训练集中位数填充。",
+            key="genos_url_input_field",
+        )
+        if genos_url_input != st.session_state.get("genos_embed_url", ""):
+            st.session_state["genos_embed_url"] = genos_url_input.strip()
+            if genos_url_input.strip():
+                st.success(f"Genos embedding URL 已设置（本次会话有效）")
+            else:
+                st.info("Genos embedding URL 已清除，将使用训练集中位数填充。")
+
+        # 显示当前 Genos 评分模式
+        _embed_url = st.session_state.get("genos_embed_url", "").strip()
+        if GENOS_API_KEY:
+            st.caption("当前模式：**Stomics Cloud API**（GENOS_API_KEY 已设置，优先级最高）")
+        elif _embed_url and _GENOS_EMB_AVAILABLE:
+            st.caption(f"当前模式：**本地 Genos embedding**（余弦距离，500bp 上下文）  \n"
+                       f"URL: `{_embed_url}`")
+        else:
+            st.caption("当前模式：**训练集中位数填充**（Genos Score* = 0.676）  \n"
+                       "设置 URL 后可启用本地 embedding 评分。")
 
     st.divider()
 
