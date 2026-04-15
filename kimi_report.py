@@ -263,7 +263,7 @@ def _build_system_prompt(template: str = "chinese") -> str:
         return (
             "你是一位临床遗传学专家。基于SNV-judge v5系统的多源证据，生成一份简洁的变异解读摘要（3-5句话）。\n"
             "第一句：变异信息和预测结果；第二句：最关键证据；第三句：人群频率；第四句：综合ACMG建议。\n"
-            "直接输出摘要段落，无需标题。末尾注明"AI辅助生成，仅供参考"。"
+            "直接输出摘要段落，无需标题。末尾注明「AI辅助生成，仅供参考」。"
         )
     else:  # chinese (default)
         return (
