@@ -1,4 +1,4 @@
-# SNV-judge v5: Ensemble SNV Pathogenicity Predictor with Genomic Foundation Models
+# SNV-judge v5.2: Ensemble SNV Pathogenicity Predictor with Genomic Foundation Models
 
 An interpretable ensemble meta-model that integrates classical pathogenicity scoring tools with **state-of-the-art genomic foundation models** — [Evo2](https://arcinstitute.org/manuscripts/Evo2) (Arc Institute / NVIDIA) and [Genos](https://github.com/zhejianglab/Genos) (Zhejiang Lab) — plus **phyloP evolutionary conservation** and **gnomAD v4 population allele frequency** to predict the pathogenicity of human missense SNVs.
 
@@ -8,8 +8,14 @@ Trained on **2,000 ClinVar missense variants** across **547 genes** (balanced 1:
 
 ---
 
-## What's New in v5
+## What's New
 
+### v5.2 (current)
+- **`predict.py` offline CLI** (`skill/scripts/predict.py`): Full offline prediction script with 18 functions — VEP annotation, gnomAD AF, ClinVar lookup, SHAP waterfall, batch VCF scoring, and `print_shap_summary()` for terminal-friendly feature contribution display
+- **Genos Embedding URL** in app Settings: Enter a local ngrok endpoint to use Genos-10B embedding cosine-distance scoring without a Stomics Cloud API key (3-tier fallback: Cloud API → local embedding → training median)
+- **LOGO-CV figure** in Model Info panel: Interactive generalization chart across 16 disease gene families
+
+### v5.0 → v5.1
 | | v1 | v2 | v3 | v4 | **v5** |
 |---|---|---|---|---|---|
 | Training variants | 842 (BRCA1/2/TP53) | 1,800 (547 genes) | 2,000 (547 genes) | 2,000 (547 genes) | **2,000 (547 genes)** |
@@ -29,17 +35,17 @@ Trained on **2,000 ClinVar missense variants** across **547 genes** (balanced 1:
 
 - **Live annotation**: Fetches SIFT, PolyPhen-2, AlphaMissense, CADD, phyloP scores via Ensembl VEP API
 - **Evo2 scoring**: Zero-shot log-likelihood ratio from Evo2-40B (9.3T token DNA foundation model) [1]
-- **Genos scoring**: Human-centric genomic foundation model pathogenicity score [2]
+- **Genos scoring**: Human-centric genomic foundation model pathogenicity score [2]; supports local embedding mode via ngrok URL (v5.2)
 - **gnomAD AF**: Population allele frequency from gnomAD v4 (ACMG BA1/PM2 signal)
 - **Stacking ensemble**: XGBoost + LightGBM with logistic regression meta-learner
-- **Isotonic calibration** *(v5 new)*: Better probability calibration than Platt Scaling (Brier 0.0685 vs 0.0743)
-- **ACMG 5-tier badge** *(v5 new)*: Automatic P/LP/VUS/LB/B classification with confidence level
-- **Variant history** *(v5 new)*: Session-level query history with side-by-side SHAP comparison
-- **Reliability diagram** *(v5 new)*: Model calibration curve in Model Info panel
-- **Interpretability**: Per-variant SHAP feature contribution chart
-- **🤖 AI Clinical Report**: Kimi LLM (Moonshot AI) synthesizes all tool outputs into a structured ACMG-style clinical interpretation report — now with **Chinese / English / Summary** template selection
+- **Isotonic calibration** *(v5)*: Better probability calibration than Platt Scaling (Brier 0.0685 vs 0.0743)
+- **ACMG 5-tier badge** *(v5)*: Automatic P/LP/VUS/LB/B classification with confidence level
+- **Variant history** *(v5)*: Session-level query history with side-by-side SHAP comparison
+- **Reliability diagram** *(v5)*: Model calibration curve in Model Info panel
+- **Interpretability**: Per-variant SHAP feature contribution chart + `print_shap_summary()` CLI output
+- **🤖 AI Clinical Report**: Kimi LLM (Moonshot AI) synthesizes all tool outputs into a structured ACMG-style clinical interpretation report — Chinese / English / Summary templates
+- **Offline CLI** *(v5.2)*: `skill/scripts/predict.py` for batch VCF scoring without the Streamlit UI
 - **Interactive UI**: Streamlit app with pathogenicity gauge, score bar chart, SHAP visualization, history tab, and AI report tab
-- **Reproducible**: Full training pipeline included (`train.py`)
 
 ---
 
@@ -119,7 +125,7 @@ Tool outputs (VEP + Evo2 + Genos + gnomAD + SHAP)
 
 **Report sections:**
 1. Variant basic information (coordinates, gene, protein change)
-2. SNV-judge v4 integrated prediction (calibrated probability)
+2. SNV-judge v5 integrated prediction (calibrated probability)
 3. Multi-dimensional evidence analysis:
    - Classical tools (SIFT/PP2/AM/CADD) → PP3/BP4 evidence
    - Genomic foundation models (Evo2/Genos)
@@ -146,7 +152,7 @@ User natural language query
   Planner Agent (Kimi K2 / LangGraph)
   ├── Step 1: VEP Agent      → SIFT · PP2 · AM · CADD · phyloP
   ├── Step 2: Evo2 Agent     → NVIDIA NIM LLR scoring
-  ├── Step 3: Genos Agent    → Stomics Cloud pathogenicity score
+  ├── Step 3: Genos Agent    → Stomics Cloud / local embedding score
   ├── Step 4: gnomAD Agent   → GraphQL population frequency
   ├── Step 5: SNV-judge Agent → Ensemble prediction + SHAP
   └── Step 6: Report Agent   → ACMG-structured clinical report
@@ -181,39 +187,50 @@ AlphaMissense remains the dominant contributor, followed by CADD and PolyPhen-2.
 
 ```
 SNV-judge/
-├── app.py                              # Streamlit web application (v5)
+├── app.py                              # Streamlit web application (v5.2)
 ├── kimi_report.py                      # Kimi LLM clinical report generation (Chinese/English/Summary)
 ├── train.py                            # Full training pipeline (data → model → evaluation)
-├── requirements.txt                    # Python dependencies (includes openai>=1.0)
-├── SNV_judge_opening_defense_v2.pptx   # Opening defense presentation
-├── xgb_model_v5.pkl                # Trained stacking classifier (v5, same 8 features as v4)
-├── platt_scaler_v5.pkl             # Isotonic Regression calibrator (v5) ← NEW
-├── train_medians_v5.pkl            # Training set medians (for NaN imputation, v5)
-├── feature_cols_v5.pkl             # Feature column names (v5)
-├── xgb_model_v4.pkl                # v4 model (fallback)
-├── platt_scaler_v4.pkl             # v4 Platt scaler (fallback)
-├── train_medians_v4.pkl            # v4 medians (fallback)
+├── requirements.txt                    # Python dependencies
+│
+├── xgb_model_v5.pkl                    # Trained stacking classifier (v5)
+├── platt_scaler_v5.pkl                 # Isotonic Regression calibrator (v5)
+├── train_medians_v5.pkl                # Training set medians (for NaN imputation)
+├── feature_cols_v5.pkl                 # Feature column names (v5)
+├── xgb_model_v4.pkl                    # v4 model (fallback)
+├── platt_scaler_v4.pkl                 # v4 Platt scaler (fallback)
+├── train_medians_v4.pkl                # v4 medians (fallback)
+│
 ├── data/
-│   ├── feature_matrix_v4.xlsx      # Complete 2,000-variant feature matrix (all scores)
-│   ├── feature_matrix_v4.csv       # Same as above in CSV format
-│   ├── calibration_metrics_v5.csv  # Calibration comparison: Uncalibrated/Platt/Isotonic ← NEW
-│   ├── model_metrics_v5.csv        # v5 CV + holdout metrics ← NEW
-│   ├── model_metrics_v4.csv        # v4 metrics (legacy)
-│   ├── scoring_ckpt.pkl            # Pre-computed Evo2 LLR + Genos scores
-│   ├── vep_scores.pkl              # Pre-computed VEP scores
-│   ├── phylop_cache.pkl            # Pre-computed phyloP scores
-│   └── gnomad_af_cache.pkl         # Pre-computed gnomAD v4 AF
+│   ├── feature_matrix_v4.xlsx          # Complete 2,000-variant feature matrix (all scores)
+│   ├── feature_matrix_v4.csv           # Same as above in CSV format
+│   ├── calibration_metrics_v5.csv      # Calibration comparison: Uncalibrated/Platt/Isotonic
+│   ├── model_metrics_v5.csv            # v5 CV + holdout metrics
+│   ├── scoring_ckpt.pkl                # Pre-computed Evo2 LLR + Genos scores
+│   ├── vep_scores.pkl                  # Pre-computed VEP scores
+│   ├── phylop_cache.pkl                # Pre-computed phyloP scores
+│   └── gnomad_af_cache.pkl             # Pre-computed gnomAD v4 AF
+│
+├── skill/                              # Offline prediction skill package
+│   ├── SKILL.md                        # Skill documentation & quick-start guide
+│   ├── scripts/
+│   │   ├── predict.py                  # Offline prediction CLI (v5.2, 1163 lines, 18 functions)
+│   │   └── generalization_eval.py      # LOGO-CV evaluation script
+│   └── references/
+│       ├── acmg-criteria.md            # ACMG/AMP variant classification criteria reference
+│       └── troubleshooting.md          # Common issues & solutions
+│
 └── figures/
-    ├── fig_calibration_comparison.png/svg  # Reliability diagram: Platt vs Isotonic ← NEW
-    ├── fig_validation_holdout.png/svg      # Holdout test ROC/PR/CM (n=300) ← NEW
-    ├── fig1_roc_comparison.png/svg         # ROC + PR curves — all versions vs baselines
-    ├── fig2_ablation.png/svg               # Ablation study — per-feature AUROC contribution
-    ├── fig3_data_distribution.png/svg      # Training set distribution
-    ├── fig4_architecture.png/svg           # System architecture diagram
-    ├── figB1_agent_workflow.png/svg        # Agent pipeline diagram
-    ├── figB2_report_demo.png/svg           # AI report demo
-    ├── figB3_plan_c_vision.png/svg         # Plan C multi-agent vision
-    └── shap_analysis_v4.png/svg            # SHAP beeswarm + bar plots
+    ├── fig_logo_cv.png/svg             # LOGO-CV generalization chart (16 genes)
+    ├── fig_calibration_comparison.png/svg  # Reliability diagram: Platt vs Isotonic
+    ├── fig_validation_holdout.png/svg  # Holdout test ROC/PR/CM (n=300)
+    ├── fig1_roc_comparison.png/svg     # ROC + PR curves — all versions vs baselines
+    ├── fig2_ablation.png/svg           # Ablation study — per-feature AUROC contribution
+    ├── fig3_data_distribution.png/svg  # Training set distribution
+    ├── fig4_architecture.png/svg       # System architecture diagram
+    ├── figB1_agent_workflow.png/svg    # Agent pipeline diagram
+    ├── figB2_report_demo.png/svg       # AI report demo
+    ├── figB3_plan_c_vision.png/svg     # Plan C multi-agent vision
+    └── shap_analysis_v4.png/svg        # SHAP beeswarm + bar plots
 ```
 
 ---
@@ -226,17 +243,17 @@ SNV-judge/
 pip install -r requirements.txt
 ```
 
-### 2. Set API keys (required for Evo2 + Genos scoring and AI report)
+### 2. Set API keys
 
 ```bash
 export EVO2_API_KEY="your-nvidia-nim-api-key"    # https://build.nvidia.com/arc-institute/evo2
 export GENOS_API_KEY="your-stomics-api-key"       # https://cloud.stomics.tech
-export KIMI_API_KEY="sk-..."                      # https://platform.moonshot.cn — enables AI clinical report
+export KIMI_API_KEY="sk-..."                      # https://platform.moonshot.cn
 ```
 
 > Without Evo2/Genos keys, the app falls back to the 4-feature base model (SIFT, PolyPhen, AlphaMissense, CADD).  
 > Without `KIMI_API_KEY`, the AI Clinical Report tab is disabled (all other features remain functional).  
-> The Kimi API key can also be entered directly in the app's Settings panel without restarting.
+> Both Kimi and Genos Embedding URL can be entered directly in the app's Settings panel without restarting.
 
 ### 3. Run the Streamlit app
 
@@ -246,7 +263,35 @@ streamlit run app.py
 
 Open `http://localhost:8501` in your browser.
 
-### 4. Example variants to try
+### 4. Offline prediction (CLI)
+
+```bash
+# Single variant
+python skill/scripts/predict.py 17 7674220 C T /path/to/SNV-judge
+
+# With Genos local embedding (no API key needed)
+python skill/scripts/predict.py 17 7674220 C T /path/to/SNV-judge \
+    --genos-url https://xxx.ngrok-free.dev
+
+# Batch VCF
+python skill/scripts/predict.py --vcf variants.vcf /path/to/SNV-judge \
+    --output results.csv
+```
+
+**Python API:**
+
+```python
+from skill.scripts.predict import load_model_artifacts, predict_variant, print_shap_summary
+
+artifacts = load_model_artifacts("/path/to/SNV-judge")
+result = predict_variant("17", 7674220, "C", "T", artifacts=artifacts)
+
+print(f"Pathogenicity: {result['prob_pathogenic']:.3f}")
+print(f"ACMG tier: {result['acmg_tier']}")
+print_shap_summary(result)   # terminal-friendly SHAP feature breakdown
+```
+
+### 5. Example variants to try
 
 | Variant | Gene | Expected |
 |---|---|---|
@@ -258,40 +303,38 @@ Open `http://localhost:8501` in your browser.
 
 ## Pre-computed Scores (No API Keys Required)
 
-All intermediate scores used to train v4 are included in `data/`:
+All intermediate scores used to train v5 are included in `data/`:
 
 | File | Contents | Coverage |
 |------|----------|----------|
 | `scoring_ckpt.pkl` | Evo2-40B LLR + Genos-10B pathogenicity scores | 1,677/2,000 (83.9%) |
-| `vep_scores.pkl` | SIFT · PolyPhen-2 · AlphaMissense · CADD (all 10,542 ClinVar variants) | 95–100% |
+| `vep_scores.pkl` | SIFT · PolyPhen-2 · AlphaMissense · CADD | 95–100% |
 | `phylop_cache.pkl` | phyloP conservation scores via Ensembl VEP | 1,922/2,000 (96.1%) |
 | `gnomad_af_cache.pkl` | gnomAD v4 allele frequencies | 2,000 entries (739 non-zero) |
 | `feature_matrix_v4.xlsx` | Complete feature matrix ready for training | 2,000 variants × 22 columns |
 
-To retrain v4 using pre-computed scores (no API keys needed):
+To retrain v5 using pre-computed scores (no API keys needed):
 ```bash
 python train.py --use-cache
 ```
 
 ### Data Provenance
 
-All pre-computed scores were generated in **March 2026**. Exact API versions and endpoints used:
+All pre-computed scores were generated in **March 2026**:
 
-| Score | API / Source | Version / Dataset | Endpoint | Date |
-|-------|-------------|-------------------|----------|------|
-| **Evo2 LLR** | NVIDIA NIM | `evo2-40b` | `https://health.api.nvidia.com/v1/biology/arc/evo2-40b/generate` | 2026-03-04 |
-| **Genos Score** | Stomics Cloud | `genos` (variant_predict) | `https://cloud.stomics.tech/api/aigateway/genos/variant_predict` | 2026-03-04 |
-| **SIFT / PolyPhen-2 / AlphaMissense / CADD / phyloP** | Ensembl VEP REST API | GRCh38 / e113 | `https://rest.ensembl.org/vep/human/region` | 2026-03-04 |
-| **gnomAD AF** | gnomAD GraphQL API | gnomAD r4 (`gnomad_r4`) | `https://gnomad.broadinstitute.org/api` | 2026-03-05 |
-| **ClinVar variants** | ClinVar FTP | Accessed March 2026 | `variant_summary.txt.gz` | 2026-03-04 |
+| Score | API / Source | Version | Date |
+|-------|-------------|---------|------|
+| **Evo2 LLR** | NVIDIA NIM `evo2-40b` | `health.api.nvidia.com` | 2026-03-04 |
+| **Genos Score** | Stomics Cloud `variant_predict` | `cloud.stomics.tech` | 2026-03-04 |
+| **SIFT / PolyPhen-2 / AlphaMissense / CADD / phyloP** | Ensembl VEP REST API | GRCh38 / e113 | 2026-03-04 |
+| **gnomAD AF** | gnomAD GraphQL API | gnomAD r4 | 2026-03-05 |
+| **ClinVar variants** | ClinVar FTP `variant_summary.txt.gz` | March 2026 | 2026-03-04 |
 
-> **Reproducibility note**: Evo2 and Genos API outputs may change as model weights are updated by their respective providers. The pre-computed `scoring_ckpt.pkl` captures the exact scores used to train v4. If you regenerate scores with newer API versions, results may differ slightly from the reported AUROC = 0.9664.
->
-> Ensembl VEP annotations (SIFT, PolyPhen-2, AlphaMissense, CADD, phyloP) are tied to Ensembl release e113 / GRCh38. gnomAD AF values reflect gnomAD v4.1 population frequencies.
+> **Reproducibility note**: Evo2 and Genos API outputs may change as model weights are updated. The pre-computed `scoring_ckpt.pkl` captures the exact scores used to train v5. Ensembl VEP annotations are tied to release e113 / GRCh38; gnomAD AF values reflect gnomAD v4.1.
+
+---
 
 ## Retrain the Model
-
-To reproduce the full pipeline from scratch:
 
 ```bash
 export EVO2_API_KEY="..."
@@ -305,8 +348,9 @@ This will:
 3. Annotate variants via Ensembl VEP REST API (SIFT, PolyPhen-2, AlphaMissense, CADD)
 4. Score variants with **Evo2** (zero-shot LLR via NVIDIA NIM) and **Genos** (Stomics cloud API)
 5. Train XGBoost + LightGBM stacking ensemble with 5-fold cross-validation
-6. Compute SHAP values and generate figures
-7. Save all model artefacts (`*_v2.pkl`)
+6. Apply Isotonic Regression calibration on out-of-fold predictions
+7. Compute SHAP values and generate figures
+8. Save all model artefacts (`*_v5.pkl`)
 
 ---
 
@@ -342,16 +386,17 @@ LLR = log P(continuation | alt_context) − log P(continuation | ref_context)
 using a 101 bp genomic window centred on the variant. A negative LLR indicates the alternate allele is less likely under the evolutionary prior, suggesting functional disruption.
 
 #### Genos Pathogenicity Score
-Genos is a 1.2B–10B parameter human-centric genomic foundation model trained on the human reference genome and population variation data [2]. We query the `variant_predict` endpoint with GRCh38 coordinates to obtain a direct pathogenicity probability.
+Genos is a 1.2B–10B parameter human-centric genomic foundation model trained on the human reference genome and population variation data [2]. We query the `variant_predict` endpoint with GRCh38 coordinates to obtain a direct pathogenicity probability. In v5.2, a local embedding mode is also supported: the model is served locally (e.g., via ngrok), and pathogenicity is estimated as the cosine distance between REF and ALT sequence embeddings from the `/extract` endpoint.
 
 ### Model
 - **Algorithm**: Stacking ensemble — XGBoost + LightGBM base learners, logistic regression meta-learner
-- **Calibration**: Platt scaling (sigmoid) fitted on out-of-fold predictions
+- **Calibration**: Isotonic Regression fitted on out-of-fold predictions (v5; replaces Platt Scaling from v4)
 - **Evaluation**: 5-fold cross-validation (stratified by label) to prevent data leakage
 - **Hyperparameters**: XGBoost (n_estimators=300, max_depth=4, lr=0.05); LightGBM (n_estimators=300, max_depth=4, lr=0.05)
 
 ### Interpretability
 - SHAP TreeExplainer computed on out-of-fold held-out samples
+- `print_shap_summary(result)` provides a terminal-friendly per-feature breakdown (feature name, value, SHAP contribution, direction arrow)
 
 ---
 
@@ -363,12 +408,11 @@ Genos is a 1.2B–10B parameter human-centric genomic foundation model trained o
 - phyloP coverage is 96% (VEP `conservation` field); missing values are imputed with training median
 - gnomAD AF coverage is 37% in the training set (many ClinVar pathogenic variants are absent from gnomAD); missing values imputed with training median (log10 scale)
 - gnomAD AF alone achieves AUROC = 0.96 on variants with data, but median imputation reduces full-dataset AUC to 0.74; XGBoost learns to use the missingness pattern itself as a signal
-- gnomAD GraphQL API adds ~1–2 seconds per variant in the app; batch scoring recommended for large VCFs
 - **MYH7 (cardiomyopathy) is a known weak gene**: LOGO-CV AUROC = 0.79, the lowest among 16 tested disease genes. Three contributing factors:
   1. **Gain-of-function mechanism**: Most MYH7 pathogenic variants act through dominant gain-of-function (altered myosin ATPase kinetics, sarcomere hypercontractility), not loss-of-function. Classical tools (SIFT, PolyPhen-2) are calibrated primarily on loss-of-function missense variants and systematically underestimate MYH7 pathogenicity.
   2. **Intermediate sequence-based scores**: MYH7 pathogenic variants cluster in the myosin head domain (residues 167–931) but often have intermediate SIFT (0.01–0.1) and PolyPhen-2 (0.5–0.85) scores, overlapping with benign variants. AlphaMissense partially compensates but is insufficient alone.
   3. **Small LOGO-CV test set**: Only 20 variants (10P/10B) per gene; AUROC estimates carry wide confidence intervals (~±0.10 at n=20).
-  - **Potential improvement**: Adding protein structure features (e.g., distance to myosin head ATP-binding site, inter-domain contact energy from AlphaFold2 structure) could improve MYH7 discrimination. This is a planned enhancement for v6.
+  - **Planned improvement (v6)**: Adding protein structure features (e.g., distance to myosin head ATP-binding site, inter-domain contact energy from AlphaFold2 structure) could improve MYH7 discrimination.
 - **Not validated for clinical use**
 
 ---
@@ -392,7 +436,6 @@ If you use this project, please cite the underlying tools:
 ## License
 
 MIT License. Note that individual scoring tools have their own licenses:
-- REVEL and ClinPred: non-commercial use only
 - AlphaMissense: CC-BY 4.0
 - CADD: free for non-commercial use
 
