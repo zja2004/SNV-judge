@@ -1079,6 +1079,99 @@ def print_shap_summary(result: dict):
         print(f"  Genos source: {result.get('genos_source', '')}")
 
 
+# =============================================================================
+# 11. 临床报告生成（LLM）
+# =============================================================================
+
+def generate_clinical_report(
+    result: dict,
+    api_key: str,
+    base_url: str = "https://api.moonshot.cn/v1",
+    model: str = "moonshot-v1-32k",
+    template: str = "chinese",
+    stream: bool = False,
+):
+    """
+    基于 predict_variant() 的结果，调用 LLM 生成 ACMG 临床解读报告。
+
+    Args:
+        result:   predict_variant() 返回的字典
+        api_key:  任意 OpenAI-compatible API Key
+        base_url: API 端点（默认 Moonshot/Kimi；可换 DashScope、OpenAI、DeepSeek 等）
+        model:    模型 ID（如 "qwen-plus", "gpt-4o", "moonshot-v1-32k"）
+        template: "chinese"（默认）| "english" | "summary"
+        stream:   False → 返回完整字符串；True → 返回 Generator（逐 chunk 输出）
+
+    Returns:
+        str（stream=False）或 Generator[str]（stream=True）
+
+    常用 provider 预设：
+        Moonshot/Kimi:   base_url="https://api.moonshot.cn/v1"
+        Alibaba DashScope: base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
+        OpenAI:          base_url="https://api.openai.com/v1"
+        DeepSeek:        base_url="https://api.deepseek.com/v1"
+
+    Example:
+        result = predict_variant("17", 7674220, "C", "T", artifacts=artifacts)
+        report = generate_clinical_report(result, api_key="sk-xxx", template="chinese")
+        print(report)
+    """
+    import sys, os
+    # 找到 kimi_report.py（在 SNV-judge 根目录）
+    _skill_dir  = os.path.dirname(os.path.abspath(__file__))          # skill/scripts/
+    _root_dir   = os.path.dirname(os.path.dirname(_skill_dir))        # SNV-judge/
+    if _root_dir not in sys.path:
+        sys.path.insert(0, _root_dir)
+
+    try:
+        import kimi_report as _kr
+    except ImportError:
+        raise ImportError(
+            "kimi_report.py not found. Make sure you are running from the SNV-judge repo root, "
+            "or that the repo root is in sys.path."
+        )
+
+    # 从 result 中提取 kimi_report 需要的参数
+    vep     = result.get("vep_scores", {})
+    variant_info = {
+        "chrom": result.get("chrom", "?"),
+        "pos":   result.get("pos",   0),
+        "ref":   result.get("ref",   "?"),
+        "alt":   result.get("alt",   "?"),
+    }
+    scores = {
+        "gene":        vep.get("gene", ""),
+        "transcript":  vep.get("transcript", ""),
+        "hgvsp":       vep.get("hgvsp", ""),
+        "consequence": vep.get("consequence", ""),
+        "sift_score":  result.get("feature_vec", [None])[0],
+        "polyphen_score": result.get("feature_vec", [None, None])[1] if len(result.get("feature_vec", [])) > 1 else None,
+        "am_pathogenicity": result.get("feature_vec", [None]*3)[2] if len(result.get("feature_vec", [])) > 2 else None,
+        "cadd_phred":  result.get("feature_vec", [None]*4)[3] if len(result.get("feature_vec", [])) > 3 else None,
+    }
+    feat_vec   = result.get("feature_vec", [])
+    shap_vals  = result.get("shap_values", [])
+    cal_prob   = result.get("cal_prob", float("nan"))
+    evo2_llr   = feat_vec[4] if len(feat_vec) > 4 else float("nan")
+    genos_path = feat_vec[5] if len(feat_vec) > 5 else float("nan")
+    gnomad_log = feat_vec[7] if len(feat_vec) > 7 else float("nan")
+
+    gen = _kr.generate_report_stream(
+        variant_info, scores, shap_vals, cal_prob,
+        evo2_llr, genos_path, gnomad_log,
+        model_ver="v5",
+        template=template,
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+    )
+
+    if stream:
+        return gen
+    else:
+        return "".join(gen)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="SNV-judge v5.2 — Offline Variant Pathogenicity Predictor",

@@ -1,6 +1,6 @@
 ---
 name: snv-judge
-description: Predict the pathogenicity of a human missense SNV (single nucleotide variant) using SNV-judge v5.2. Returns a calibrated probability (0–1), ACMG 5-tier classification (P/LP/VUS/LB/B), and per-feature SHAP contributions. Use this skill whenever a user asks to classify, score, or interpret a genetic variant, or wants to know whether a mutation is likely disease-causing.
+description: Predict the pathogenicity of a human missense SNV (single nucleotide variant) using SNV-judge v5.2. Returns a calibrated probability (0–1), ACMG 5-tier classification (P/LP/VUS/LB/B), per-feature SHAP contributions, and optionally a full LLM-generated clinical interpretation report (Chinese/English/summary). Use this skill whenever a user asks to classify, score, interpret, or generate a clinical report for a genetic variant.
 ---
 
 # SNV-judge v5.2 — Variant Pathogenicity Prediction
@@ -32,8 +32,17 @@ User request
 ├── User provides gene name + amino acid change (e.g. "TP53 R175H")
 │   └── resolve_protein_variant()  →  then predict_variant()
 │
-└── User wants ClinVar ground truth alongside prediction
-    └── predict_variant()  +  fetch_clinvar_classification()
+├── User wants ClinVar ground truth alongside prediction
+│   └── predict_variant()  +  fetch_clinvar_classification()
+│
+└── User wants a clinical report / interpretation document
+    ├── Has LLM API key?
+    │   ├── Yes → predict_variant()  →  generate_clinical_report()
+    │   │         choose template: "chinese" | "english" | "summary"
+    │   └── No  → predict_variant()  →  print_shap_summary()
+    │             tell user to provide an OpenAI-compatible API key to enable reports
+    └── User wants to stream report in real-time (e.g. Streamlit)
+        └── generate_clinical_report(..., stream=True)  →  iterate chunks
 ```
 
 ---
@@ -44,20 +53,21 @@ User request
 import sys
 sys.path.insert(0, '.')  # run from SNV-judge repo root
 from skill.scripts.predict import (
-    load_artifacts,
+    load_model_artifacts,
     predict_variant,
     resolve_protein_variant,
     predict_vcf,
     fetch_clinvar_classification,
+    generate_clinical_report,
     print_result,
     print_shap_summary,
 )
 
 # Load model — do this ONCE and reuse artifacts for all predictions
-artifacts = load_artifacts(".")
+artifacts = load_model_artifacts(".")
 ```
 
-**If `load_artifacts` fails:** see [Troubleshooting](./references/troubleshooting.md#model-issues).
+**If `load_model_artifacts` fails:** see [Troubleshooting](./references/troubleshooting.md#model-issues).
 
 ---
 
@@ -122,7 +132,53 @@ results = predict_vcf(
 # results is a list of dicts, same structure as predict_variant()
 ```
 
-### 4. Fetch ClinVar ground truth
+### 4. Generate clinical report (LLM)
+
+```python
+# Requires any OpenAI-compatible API key
+report = generate_clinical_report(
+    result,                                    # from predict_variant()
+    api_key="sk-xxx",
+    base_url="https://api.moonshot.cn/v1",     # or DashScope / OpenAI / DeepSeek
+    model="moonshot-v1-32k",                   # or "qwen-plus", "gpt-4o", etc.
+    template="chinese",                        # "chinese" | "english" | "summary"
+    stream=False,                              # True → returns Generator for streaming
+)
+print(report)
+```
+
+**Provider presets** (swap `base_url` + `model` freely):
+
+| Provider | base_url | Example model |
+|---|---|---|
+| Moonshot / Kimi | `https://api.moonshot.cn/v1` | `moonshot-v1-32k` |
+| Alibaba DashScope | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-plus` |
+| OpenAI | `https://api.openai.com/v1` | `gpt-4o` |
+| DeepSeek | `https://api.deepseek.com/v1` | `deepseek-chat` |
+
+**Report templates:**
+
+| template | Language | Length | Use when |
+|---|---|---|---|
+| `"chinese"` | 中文 | ~800 words, 6 sections | Default clinical report |
+| `"english"` | English | ~800 words, 6 sections | International / publication |
+| `"summary"` | 中文 | 3–5 sentences | Quick interpretation |
+
+**Report sections** (chinese / english):
+1. Variant information (coordinates, gene, HGVSp)
+2. Integrated prediction (cal_prob, ACMG class)
+3. Multi-dimensional evidence (PP3/BP4 per tool, PM2/BA1 for gnomAD)
+4. SHAP feature contributions
+5. Clinical significance and recommendations
+6. Limitations
+
+**Streaming** (for real-time display):
+```python
+for chunk in generate_clinical_report(result, api_key="sk-xxx", stream=True):
+    print(chunk, end="", flush=True)
+```
+
+### 5. Fetch ClinVar ground truth
 
 ```python
 cv = fetch_clinvar_classification("17", 7674220, "C", "T")
@@ -164,35 +220,51 @@ For full ACMG criteria details: [acmg-criteria.md](./references/acmg-criteria.md
 
 ---
 
-## Example: Complete workflow
+## Example: Complete workflow (predict + SHAP + report)
 
 ```python
 import sys
 sys.path.insert(0, '.')
-from skill.scripts.predict import *
+from skill.scripts.predict import (
+    load_model_artifacts, resolve_protein_variant, predict_variant,
+    fetch_clinvar_classification, print_shap_summary, generate_clinical_report,
+)
 
-artifacts = load_artifacts(".")
+artifacts = load_model_artifacts(".")
 
-# Predict TP53 R175H
-coords  = resolve_protein_variant("TP53", "R175H")
-result  = predict_variant(coords["chrom"], coords["pos"],
-                          coords["ref"], coords["alt"],
-                          artifacts=artifacts)
-cv      = fetch_clinvar_classification(coords["chrom"], coords["pos"],
-                                       coords["ref"], coords["alt"])
+# Step 1: resolve protein variant name → genomic coordinates
+coords = resolve_protein_variant("TP53", "R175H")
 
+# Step 2: predict
+result = predict_variant(
+    coords["chrom"], coords["pos"], coords["ref"], coords["alt"],
+    artifacts=artifacts,
+)
+
+# Step 3: ClinVar ground truth
+cv = fetch_clinvar_classification(
+    coords["chrom"], coords["pos"], coords["ref"], coords["alt"],
+)
+
+# Step 4: print summary
 print(f"P(pathogenic) : {result['cal_prob']:.1%}")
 print(f"ACMG class    : {result['acmg_class']}")
 print(f"ClinVar       : {cv['clinical_significance']}")
 print_shap_summary(result)
+
+# Step 5: generate clinical report (requires API key)
+report = generate_clinical_report(
+    result,
+    api_key="sk-xxx",                              # any OpenAI-compatible key
+    base_url="https://api.moonshot.cn/v1",         # swap for DashScope / OpenAI etc.
+    model="moonshot-v1-32k",
+    template="chinese",                            # or "english" / "summary"
+)
+print(report)
 ```
 
-Expected output:
+Expected SHAP output:
 ```
-P(pathogenic) : 100.0%
-ACMG class    : Pathogenic
-ClinVar       : Pathogenic/Likely pathogenic
-
 SHAP Feature Contributions
 ──────────────────────────────────────────────────
   AlphaMissense          1.000   SHAP +2.627  ▲ pathogenic
@@ -207,6 +279,24 @@ SHAP Feature Contributions
   Top driver: gnomAD log-AF  (SHAP +2.730)
   Calibrated P(pathogenic): 100.0%
   ACMG class: Pathogenic
+```
+
+Expected report structure (chinese template):
+```markdown
+## 变异解读报告
+### 一、变异基本信息
+chr17:7674220 C>T | 基因: TP53 | p.Arg175His
+### 二、集成预测结果
+致病概率: 100.0% | ACMG分级: Pathogenic
+### 三、多维度证据分析
+#### 3.1 经典注释工具证据（PP3/BP4）...
+#### 3.4 人群频率证据（BA1/PM2）...
+#### 3.5 SHAP特征贡献分析...
+### 四、综合分类建议 ...
+### 五、临床意义与建议 ...
+### 六、局限性说明 ...
+---
+*本报告由SNV-judge v5智能体系统自动生成，仅供科研参考，不构成临床诊断依据。*
 ```
 
 ---

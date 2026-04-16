@@ -64,6 +64,33 @@ results = run_logo_cv("data/feature_matrix_v4.csv", model_dir=".")
 - Default batch_size=50 for VEP. Max 200.
 - For > 500 variants, split into chunks and run overnight
 
+## Report generation errors
+
+**`ImportError: kimi_report.py not found`**
+→ `generate_clinical_report()` looks for `kimi_report.py` in the SNV-judge repo root.
+→ Make sure `sys.path` includes the repo root, or run from the repo root directory.
+
+**`ValueError: 未设置 API Key`**
+→ Pass `api_key="sk-xxx"` explicitly to `generate_clinical_report()`.
+→ Or set env var: `export LLM_API_KEY="sk-xxx"`
+
+**`openai.AuthenticationError`**
+→ Wrong API key for the chosen provider. Verify key at the provider's dashboard.
+
+**`openai.NotFoundError` (model not found)**
+→ The `model` ID doesn't exist for this provider. Call `list_models(base_url, api_key)` to see available models:
+```python
+import sys; sys.path.insert(0, '.')
+import kimi_report
+print(kimi_report.list_models("https://dashscope.aliyuncs.com/compatible-mode/v1", "sk-xxx"))
+```
+
+**Report is in wrong language**
+→ Set `template="english"` for English, `template="chinese"` for Chinese, `template="summary"` for a 3-5 sentence summary.
+
+**Report generation is slow**
+→ Normal: LLM generation takes 10–30 seconds for full reports. Use `stream=True` to show progress in real-time.
+
 ## Coordinate system
 
 - All coordinates are **GRCh38 / hg38**, 1-based
