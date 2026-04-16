@@ -1,88 +1,44 @@
-# ACMG/AMP Variant Classification Criteria
-## Relevant to SNV-judge v5 Features
+# ACMG Evidence Criteria — SNV-judge v5.2
 
 Reference: Richards et al., Genetics in Medicine 2015
 
----
+## What SNV-judge covers
 
-## Evidence Criteria Used by SNV-judge
+SNV-judge provides **computational evidence only** — equivalent to PP3 (pathogenic supporting) and BP4 (benign supporting) in the ACMG framework. It does NOT evaluate functional studies, segregation, de novo status, or allelic data.
 
-### Pathogenic Evidence
+## Per-feature thresholds
 
-| Criterion | Strength | SNV-judge Feature | Threshold |
-|-----------|----------|-------------------|-----------|
-| **PP3** | Supporting | SIFT, PolyPhen-2, AlphaMissense, CADD, Evo2, Genos, phyloP | Multiple tools predict damaging |
-| **PM2** | Moderate | gnomAD log-AF | AF < 1×10⁻⁴ (absent or very rare) |
+| Feature | PP3 (pathogenic) | BP4 (benign) | Notes |
+|---|---|---|---|
+| SIFT (inv) | > 0.5 | < 0.5 | Raw SIFT inverted; higher = more damaging |
+| PolyPhen-2 | > 0.85 | < 0.15 | "probably_damaging" vs "benign" |
+| AlphaMissense | > 0.564 | < 0.340 | 0.340–0.564 = ambiguous |
+| CADD Phred | > 20 (top 1%) | — | > 30 = top 0.1% |
+| Evo2-40B LLR | < -0.3 (supporting) | — | < -1.0 = moderate |
+| Genos-10B | > 0.7 | — | Range 0–1 |
+| phyloP | > 2.0 (conserved) | < -0.5 (accelerated) | UCSC 100-way |
+| gnomAD log-AF | < -4.0 → PM2 | > -1.30 → BA1 | Absent (−8.0) = strongest PM2 |
 
-### Benign Evidence
+## ACMG 5-tier output mapping
 
-| Criterion | Strength | SNV-judge Feature | Threshold |
-|-----------|----------|-------------------|-----------|
-| **BP4** | Supporting | SIFT, PolyPhen-2, AlphaMissense, CADD | Multiple tools predict benign |
-| **BA1** | Stand-alone | gnomAD log-AF | AF > 5% in any population |
+| cal_prob | ACMG class | Evidence strength |
+|---|---|---|
+| ≥ 0.90 | Pathogenic | PP3 strong (multiple tools concordant) |
+| 0.70–0.90 | Likely Pathogenic | PP3 moderate |
+| 0.40–0.70 | VUS | Conflicting or insufficient evidence |
+| 0.20–0.40 | Likely Benign | BP4 moderate |
+| < 0.20 | Benign | BP4 strong |
 
----
+## gnomAD AF signal
 
-## Tool-Specific Thresholds
+gnomAD AF is the single strongest feature (SHAP rank #1 in most variants). Key points:
+- 37% of training variants have gnomAD data; the rest are imputed at log-AF = −4.48
+- XGBoost learns the **missingness pattern** itself as a PM2-like signal (absent from gnomAD → likely pathogenic)
+- BA1 (stand-alone benign): AF > 5% in any population → log-AF > −1.30
 
-### SIFT (inverted in SNV-judge)
-- Raw SIFT score: 0 = most damaging, 1 = tolerated
-- SNV-judge uses `1 - SIFT` so higher = more damaging
-- **PP3**: SIFT_inv > 0.5 (raw SIFT < 0.5, "deleterious")
-- **BP4**: SIFT_inv < 0.5 (raw SIFT ≥ 0.5, "tolerated")
+## Important caveats for agent responses
 
-### PolyPhen-2
-- Range: 0–1 (higher = more damaging)
-- **PP3**: > 0.85 ("probably_damaging")
-- **BP4**: < 0.15 ("benign")
-
-### AlphaMissense (Google DeepMind)
-- Range: 0–1 (higher = more pathogenic)
-- **PP3**: > 0.564 ("likely_pathogenic")
-- **BP4**: < 0.340 ("likely_benign")
-- 0.340–0.564: "ambiguous"
-
-### CADD Phred
-- Higher = more deleterious
-- **PP3**: > 20 (top 1% most deleterious variants)
-- **PP3 strong**: > 30 (top 0.1%)
-
-### Evo2-40B LLR
-- Negative = alt allele less likely under evolutionary prior (damaging)
-- **PP3 supporting**: LLR < -0.3
-- **PP3 moderate**: LLR < -1.0
-
-### Genos-10B
-- Range: 0–1 (higher = more pathogenic)
-- **PP3**: > 0.7
-
-### phyloP
-- Positive = conserved, negative = accelerated evolution
-- **PP3**: > 2.0 (highly conserved)
-- **BP4**: < -0.5 (evolutionarily accelerated)
-
-### gnomAD v4 Allele Frequency
-- SNV-judge stores as log10(AF + 1e-8)
-- **BA1**: AF > 0.05 (log-AF > -1.30)
-- **PM2**: AF < 1×10⁻⁴ (log-AF < -4.0) or absent (log-AF = -8.0)
-
----
-
-## ACMG 5-Tier Classification (SNV-judge thresholds)
-
-| Calibrated Probability | Classification | ACMG Code |
-|------------------------|---------------|-----------|
-| ≥ 0.90 | Pathogenic (P) | High confidence |
-| 0.70–0.90 | Likely Pathogenic (LP) | Moderate confidence |
-| 0.40–0.70 | VUS | Uncertain significance |
-| 0.20–0.40 | Likely Benign (LB) | Moderate confidence |
-| < 0.20 | Benign (B) | High confidence |
-
----
-
-## Important Notes
-
-1. SNV-judge provides **computational evidence only** (PP3/BP4 category)
-2. Clinical classification requires integration with functional data, segregation, de novo status, etc.
-3. The model is **not validated for clinical use** — research only
-4. gnomAD AF alone achieves AUROC=0.96 on variants with data, but median imputation reduces full-dataset AUC to 0.74; XGBoost learns to use the missingness pattern itself as a PM2-like signal
+1. Always state that SNV-judge is **not validated for clinical use**
+2. For VUS (0.40–0.70), explicitly note that additional evidence is needed
+3. For MYH7 variants, add: "MYH7 is a known weak gene for this model (AUROC 0.79); interpret with caution"
+4. If `genos_source = "median_imputed"`, note that Evo2/Genos scores were unavailable and imputed
