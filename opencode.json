@@ -1,0 +1,26 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "dashscope": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "DashScope (Aliyun)",
+      "options": {
+        "baseURL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "apiKey": "sk-3d3ca66a82a448da83e51da041c4e159"
+      },
+      "models": {
+        "glm-5": {
+          "name": "GLM-5",
+          "limit": { "context": 128000, "output": 8192 }
+        }
+      }
+    }
+  },
+  "model": "dashscope/glm-5",
+  "autoupdate": false,
+  "permission": {
+    "bash": "allow",
+    "edit": "allow",
+    "write": "allow"
+  }
+}
