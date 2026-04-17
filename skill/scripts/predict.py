@@ -425,10 +425,20 @@ def fetch_genos_embedding_score(
 
     jaccard_sim  = intersection / union
     jaccard_dist = 1.0 - jaccard_sim
-    genos_score  = float(np.clip(jaccard_dist, 0.0, 1.0))
+
+    # ── 分布重映射：Jaccard → 训练集 genos_score 量纲 ──────────────────────
+    # 问题：k-mer Jaccard 距离实测范围 ~[0.00, 0.15]，远低于训练集 genos_score
+    #       中位数 0.676（范围 ~[0.30, 0.90]）。若不重映射，模型会将低 Jaccard
+    #       值误判为良性，导致 SHAP 方向反转。
+    # 映射公式（线性）：mapped = 0.30 + jaccard_dist * 4.0，clip 到 [0.30, 0.90]
+    #   - Jaccard=0.00 → 0.30（续写完全相同，良性下界）
+    #   - Jaccard=0.15 → 0.90（最大观测差异，致病上界）
+    #   - Jaccard=0.094 → 0.676（对应训练集中位数）
+    genos_score = float(np.clip(0.30 + jaccard_dist * 4.0, 0.30, 0.90))
 
     print(f"  ✓ Genos 生成差异评分: {genos_score:.4f}  "
-          f"（k-mer Jaccard 距离 k={k}，REF↔ALT 续写，flank={flank}bp）")
+          f"（Jaccard={jaccard_dist:.4f} → 重映射后 {genos_score:.4f}，"
+          f"k={k}，flank={flank}bp）")
     return genos_score
 
 
@@ -442,10 +452,13 @@ def fetch_clinvar_classification(chrom: str, pos: int, ref: str, alt: str) -> di
     查询 ClinVar 临床意义分类（免费，无需 API Key）。
 
     实现策略（两步）：
-      Step 1: 调用 Ensembl VEP REST API，从 colocated_variants 中提取 rsID 和
-              clin_sig 字段。VEP 已整合 ClinVar 数据，是最可靠的坐标→ClinVar 路径。
-      Step 2: 用 rsID 调用 NCBI dbSNP esummary 获取更详细的 ClinVar 信息
-              （条件、review status 等）。若 Step 2 失败，仅返回 Step 1 的数据。
+      Step 1: 调用 Ensembl VEP REST API，从 colocated_variants 中提取 rsID、
+              allele-specific clin_sig，以及 var_synonyms.ClinVar 中的 VCV 编号。
+      Step 2: 用 VCV 编号调用 NCBI ClinVar efetch（rettype=vcv, retmode=xml）
+              获取 review_status、conditions、last_evaluated。
+              efetch VCV XML 是获取这些字段最可靠的方式（esearch[rs] 在 clinvar
+              db 中不可靠，返回空列表）。
+              若 Step 2 失败，仍返回 Step 1 的 significance 数据。
 
     Args:
         chrom: 染色体（不含 chr 前缀，GRCh38）
@@ -457,6 +470,9 @@ def fetch_clinvar_classification(chrom: str, pos: int, ref: str, alt: str) -> di
         dict with keys: clinvar_id, clinical_significance, review_status,
                         conditions, last_evaluated, rsid
     """
+    import xml.etree.ElementTree as ET
+    import re as _re
+
     try:
         # ── Step 1: VEP colocated_variants ──────────────────────────────────
         vep_url = (f"https://rest.ensembl.org/vep/homo_sapiens/region/"
@@ -473,31 +489,45 @@ def fetch_clinvar_classification(chrom: str, pos: int, ref: str, alt: str) -> di
 
         colocated = data[0].get("colocated_variants", [])
 
-        # 找匹配 alt 等位基因的 rsID 和 clin_sig
+        # 找匹配 alt 等位基因的 rsID、clin_sig 和 VCV 编号
         rsid     = ""
         clin_sig = []
+        vcv_id   = ""          # numeric VCV ID for efetch
+
         for cv in colocated:
             cv_id = cv.get("id", "")
             if not cv_id.startswith("rs"):
                 continue
-            # 检查 alt 等位基因是否在 clin_sig_allele 中
+            cv_clin_sig = cv.get("clin_sig", [])
+            if not cv_clin_sig:
+                continue
+
+            # 过滤出与 alt 等位基因匹配的分类
             clin_sig_allele = cv.get("clin_sig_allele", [])
-            cv_clin_sig     = cv.get("clin_sig", [])
-            if cv_clin_sig:
-                # 过滤出与 alt 等位基因匹配的分类
-                alt_sigs = []
-                for entry in (clin_sig_allele if isinstance(clin_sig_allele, list)
-                              else [clin_sig_allele]):
-                    # 格式: "T:pathogenic" 或 "A:pathogenic/likely_pathogenic"
-                    if isinstance(entry, str) and ":" in entry:
-                        allele_part, sig_part = entry.split(":", 1)
-                        if allele_part.upper() == alt.upper():
-                            alt_sigs.extend(sig_part.split("/"))
-                if not alt_sigs:
-                    alt_sigs = cv_clin_sig  # fallback: use all sigs
-                rsid     = cv_id
-                clin_sig = list(dict.fromkeys(alt_sigs))  # deduplicate, preserve order
-                break
+            alt_sigs = []
+            for entry in (clin_sig_allele if isinstance(clin_sig_allele, list)
+                          else [clin_sig_allele]):
+                # 格式: "T:pathogenic" 或 "A:pathogenic/likely_pathogenic"
+                if isinstance(entry, str) and ":" in entry:
+                    allele_part, sig_part = entry.split(":", 1)
+                    if allele_part.upper() == alt.upper():
+                        alt_sigs.extend(sig_part.split("/"))
+            if not alt_sigs:
+                alt_sigs = cv_clin_sig  # fallback: use all sigs
+
+            rsid     = cv_id
+            clin_sig = list(dict.fromkeys(alt_sigs))  # deduplicate, preserve order
+
+            # 从 var_synonyms.ClinVar 提取数字最小的 VCV（最早注册的主记录）
+            synonyms = cv.get("var_synonyms", {}).get("ClinVar", [])
+            vcv_nums = []
+            for s in synonyms:
+                m = _re.search(r"VCV0*(\d+)", s)
+                if m:
+                    vcv_nums.append(int(m.group(1)))
+            if vcv_nums:
+                vcv_id = str(min(vcv_nums))
+            break
 
         if not rsid:
             return {"clinvar_id": None, "clinical_significance": "Not in ClinVar",
@@ -509,43 +539,52 @@ def fetch_clinvar_classification(chrom: str, pos: int, ref: str, alt: str) -> di
 
         sig_display = " / ".join(_normalize(s) for s in clin_sig) if clin_sig else "Unknown"
 
-        # ── Step 2: NCBI esummary via rsID for review_status + conditions ───
+        # ── Step 2: ClinVar efetch VCV XML → review_status + conditions ─────
+        # esearch clinvar term=rsID[rs] 不可靠（返回空列表）；
+        # 改用 VEP 已提供的 VCV 编号直接 efetch，稳定可靠。
         review_status = ""
         conditions    = []
         last_eval     = ""
-        clinvar_id    = ""
+        clinvar_id    = rsid   # fallback: use rsid if VCV fetch fails
 
-        try:
-            search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
-            sr = requests.get(search_url,
-                              params={"db": "clinvar", "term": f"{rsid}[rs]",
-                                      "retmode": "json", "retmax": 3},
-                              timeout=10)
-            ids = sr.json().get("esearchresult", {}).get("idlist", [])
-            if ids:
-                sum_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
-                sr2 = requests.get(sum_url,
-                                   params={"db": "clinvar", "id": ",".join(ids[:3]),
-                                           "retmode": "json"},
-                                   timeout=10)
-                result = sr2.json().get("result", {})
-                for uid in result.get("uids", []):
-                    entry = result[uid]
-                    gc    = entry.get("germline_classification", {})
-                    if gc.get("description"):
-                        review_status = gc.get("review_status", "")
-                        last_eval     = gc.get("last_evaluated", "")
-                        clinvar_id    = entry.get("accession", "")
-                        for t in gc.get("trait_set", []):
-                            name = t.get("trait_name", "")
-                            if name:
-                                conditions.append(name)
-                        break
-        except Exception:
-            pass  # Step 2 失败时仍返回 Step 1 数据
+        if vcv_id:
+            try:
+                efetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+                r2 = requests.get(efetch_url, params={
+                    "db": "clinvar", "id": vcv_id,
+                    "rettype": "vcv", "retmode": "xml", "is_variationid": "1"
+                }, timeout=15)
+                if r2.status_code == 200:
+                    root = ET.fromstring(r2.text)
+                    va   = root.find(".//VariationArchive")
+                    if va is not None:
+                        clinvar_id = va.get("Accession", clinvar_id)
+
+                        rs_el = va.find(".//GermlineClassification/ReviewStatus")
+                        if rs_el is not None:
+                            review_status = rs_el.text or ""
+
+                        desc_el = va.find(".//GermlineClassification/Description")
+                        if desc_el is not None:
+                            last_eval = desc_el.get("DateLastEvaluated", "")
+
+                        # conditions: deduplicated, filter "not provided / not specified"
+                        seen = set()
+                        for trait in va.findall(".//TraitSet/Trait"):
+                            for name_el in trait.findall("Name/ElementValue"):
+                                if name_el.get("Type") == "Preferred":
+                                    name = (name_el.text or "").strip()
+                                    nl   = name.lower()
+                                    if nl not in ("not provided", "not specified", "") \
+                                            and nl not in seen:
+                                        seen.add(nl)
+                                        conditions.append(name)
+                                    break
+            except Exception:
+                pass  # Step 2 失败时仍返回 Step 1 数据
 
         return {
-            "clinvar_id":            clinvar_id or rsid,
+            "clinvar_id":            clinvar_id,
             "clinical_significance": sig_display,
             "review_status":         review_status,
             "conditions":            conditions,
@@ -1215,12 +1254,15 @@ def generate_clinical_report(
     evo2_llr   = feat_vec[4] if len(feat_vec) > 4 else float("nan")
     genos_path = feat_vec[5] if len(feat_vec) > 5 else float("nan")
     gnomad_log = feat_vec[7] if len(feat_vec) > 7 else float("nan")
+    # 传入模型输出的 ACMG 分级，防止 LLM 自行降级
+    acmg_class = result.get("acmg_class", "")
 
     gen = _kr.generate_report_stream(
         variant_info, scores, shap_vals, cal_prob,
         evo2_llr, genos_path, gnomad_log,
         model_ver="v5",
         template=template,
+        acmg_class=acmg_class,
         base_url=base_url,
         api_key=api_key,
         model=model,

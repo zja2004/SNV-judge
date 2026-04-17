@@ -178,14 +178,23 @@ def _build_evidence_context(
     genos_path: float = float("nan"),
     gnomad_log_af: float = float("nan"),
     model_ver: str = "v5",
+    acmg_class: str = "",          # 直接传入模型输出的 ACMG 分级（如 "Pathogenic (P)"）
 ) -> str:
     """Build structured evidence summary string to pass to the LLM."""
-    if cal_prob >= PATHOGENIC_THRESH:
+    # 优先使用调用方传入的 acmg_class（来自 predict_variant() 的 5 级分类）
+    # 若未传入，则根据校准概率推断（与 predict.py ACMG_TIERS 保持一致）
+    if acmg_class:
+        classification = f"{acmg_class}（校准概率 {cal_prob:.1%}）"
+    elif cal_prob >= 0.90:
+        classification = f"致病（Pathogenic，概率 {cal_prob:.1%}）"
+    elif cal_prob >= 0.70:
         classification = f"可能致病（Likely Pathogenic，概率 {cal_prob:.1%}）"
-    elif cal_prob >= BENIGN_THRESH:
+    elif cal_prob >= 0.40:
         classification = f"意义不明确（VUS，概率 {cal_prob:.1%}）"
-    else:
+    elif cal_prob >= 0.10:
         classification = f"可能良性（Likely Benign，概率 {cal_prob:.1%}）"
+    else:
+        classification = f"良性（Benign，概率 {cal_prob:.1%}）"
 
     labels = FEATURE_LABELS[:len(shap_vals)]
     shap_pairs = sorted(zip(labels, shap_vals), key=lambda x: abs(x[1]), reverse=True)
@@ -243,7 +252,10 @@ def _build_system_prompt(template: str = "chinese") -> str:
             "1. Structured sections with clear headings\n"
             "2. Explicitly cite ACMG evidence criteria (PP3, PM2, BA1, etc.)\n"
             "3. Professional tone suitable for clinical genetics consultation\n"
-            "4. End with: *AI-assisted report, for research reference only.*\n\n"
+            "4. End with: *AI-assisted report, for research reference only.*\n"
+            "5. IMPORTANT: The ACMG classification in the report MUST exactly match the "
+            "   'Integrated Prediction' field. Do NOT downgrade or upgrade the classification "
+            "   (e.g., if the system outputs Pathogenic, write Pathogenic, not Likely Pathogenic).\n\n"
             "Report format:\n"
             "## Variant Interpretation Report\n"
             "### I. Variant Information\n"
@@ -273,7 +285,10 @@ def _build_system_prompt(template: str = "chinese") -> str:
             "1. 使用中文，专业术语保留英文\n"
             "2. 明确引用ACMG证据条目（PP3、PM2、BA1等）\n"
             "3. 语气专业，适合临床遗传咨询场景\n"
-            "4. 末尾注明：本报告由AI辅助生成，仅供参考，不构成临床诊断依据\n\n"
+            "4. 末尾注明：本报告由AI辅助生成，仅供参考，不构成临床诊断依据\n"
+            "5. 【重要】报告中的ACMG分类必须与【综合分类建议】字段完全一致，"
+            "   不得自行降级或升级（例如：若系统输出为Pathogenic，报告必须写Pathogenic，"
+            "   不得改写为Likely Pathogenic）\n\n"
             "报告格式：\n"
             "## 变异解读报告\n"
             "### 一、变异基本信息\n"
@@ -303,6 +318,7 @@ def generate_report_stream(
     gnomad_log_af: float = float("nan"),
     model_ver: str = "v5",
     template: str = "chinese",
+    acmg_class: str = "",          # 直接传入 predict_variant() 的 ACMG 分级字符串
     # LLM backend — if None, falls back to env-var defaults
     base_url: str | None = None,
     api_key: str | None = None,
@@ -313,10 +329,13 @@ def generate_report_stream(
     Compatible with Streamlit st.write_stream().
 
     Args:
-        base_url:  OpenAI-compatible API base URL (e.g. DashScope, Moonshot, OpenAI)
-        api_key:   API key for the chosen provider
-        model:     Model ID to use (e.g. "qwen-plus", "moonshot-v1-32k", "gpt-4o")
-        template:  "chinese" | "english" | "summary"
+        base_url:   OpenAI-compatible API base URL (e.g. DashScope, Moonshot, OpenAI)
+        api_key:    API key for the chosen provider
+        model:      Model ID to use (e.g. "qwen-plus", "moonshot-v1-32k", "gpt-4o")
+        template:   "chinese" | "english" | "summary"
+        acmg_class: ACMG classification string from predict_variant() (e.g. "Pathogenic (P)").
+                    When provided, the LLM is instructed to use this exact classification
+                    and not downgrade/upgrade it independently.
 
     Yields:
         str: text chunks from the LLM stream
@@ -339,6 +358,7 @@ def generate_report_stream(
     evidence = _build_evidence_context(
         variant_info, scores, shap_vals, cal_prob,
         evo2_llr, genos_path, gnomad_log_af, model_ver,
+        acmg_class=acmg_class,
     )
 
     if template == "english":
@@ -388,6 +408,7 @@ def generate_report(
     gnomad_log_af: float = float("nan"),
     model_ver: str = "v5",
     template: str = "chinese",
+    acmg_class: str = "",
     base_url: str | None = None,
     api_key: str | None = None,
     model: str | None = None,
@@ -397,5 +418,6 @@ def generate_report(
         variant_info, scores, shap_vals, cal_prob,
         evo2_llr, genos_path, gnomad_log_af, model_ver,
         template=template,
+        acmg_class=acmg_class,
         base_url=base_url, api_key=api_key, model=model,
     ))
