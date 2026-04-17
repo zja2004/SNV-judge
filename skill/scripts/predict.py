@@ -75,7 +75,7 @@ ENSEMBL_BASE = "https://rest.ensembl.org"
 
 # ── Genos 本地端点（可选，通过 --genos-url 启用）─────────────────────────
 GENOS_DEFAULT_URL = "https://neuronic-marilynn-touristically.ngrok-free.dev"
-GENOS_FLANK       = 500   # 变异位点两侧各取 500 bp（共 1001 bp）
+GENOS_FLANK       = 499   # 变异位点两侧各取 499 bp（共 999 bp，服务器 max_length=1000）
 GENOS_MODEL_NAME  = "10B" # 使用 Genos-10B 模型
 GENOS_TIMEOUT     = 120   # 单次 /generate 请求超时（秒，生成比 extract 慢）
 
@@ -438,72 +438,121 @@ def fetch_genos_embedding_score(
 # =============================================================================
 
 def fetch_clinvar_classification(chrom: str, pos: int, ref: str, alt: str) -> dict:
-    """通过 NCBI E-utilities 查询 ClinVar 临床意义分类（免费，无需 API Key）。"""
-    search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
-    fetch_url  = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+    """
+    查询 ClinVar 临床意义分类（免费，无需 API Key）。
+
+    实现策略（两步）：
+      Step 1: 调用 Ensembl VEP REST API，从 colocated_variants 中提取 rsID 和
+              clin_sig 字段。VEP 已整合 ClinVar 数据，是最可靠的坐标→ClinVar 路径。
+      Step 2: 用 rsID 调用 NCBI dbSNP esummary 获取更详细的 ClinVar 信息
+              （条件、review status 等）。若 Step 2 失败，仅返回 Step 1 的数据。
+
+    Args:
+        chrom: 染色体（不含 chr 前缀，GRCh38）
+        pos:   位置（1-based）
+        ref:   参考等位基因
+        alt:   替代等位基因
+
+    Returns:
+        dict with keys: clinvar_id, clinical_significance, review_status,
+                        conditions, last_evaluated, rsid
+    """
     try:
-        params = {
-            "db":      "clinvar",
-            "term":    f"{chrom}[Chromosome] AND {pos}[Base Position for Assembly GRCh38]",
-            "retmode": "json",
-            "retmax":  20,
-        }
-        r = requests.get(search_url, params=params, timeout=15)
+        # ── Step 1: VEP colocated_variants ──────────────────────────────────
+        vep_url = (f"https://rest.ensembl.org/vep/homo_sapiens/region/"
+                   f"{chrom}:{pos}-{pos}:1/{alt}")
+        hdrs = {"Content-Type": "application/json", "Accept": "application/json"}
+        r = requests.get(vep_url, headers=hdrs, timeout=20)
         if r.status_code != 200:
-            return {"error": f"ClinVar search failed: HTTP {r.status_code}"}
-        ids = r.json().get("esearchresult", {}).get("idlist", [])
-        if not ids:
+            return {"error": f"VEP query failed: HTTP {r.status_code}"}
+
+        data = r.json()
+        if not data:
             return {"clinvar_id": None, "clinical_significance": "Not in ClinVar",
-                    "review_status": "", "conditions": [], "last_evaluated": ""}
-        fetch_params = {
-            "db":      "clinvar",
-            "id":      ",".join(ids[:5]),
-            "rettype": "vcv",
-            "retmode": "json",
+                    "review_status": "", "conditions": [], "last_evaluated": "", "rsid": ""}
+
+        colocated = data[0].get("colocated_variants", [])
+
+        # 找匹配 alt 等位基因的 rsID 和 clin_sig
+        rsid     = ""
+        clin_sig = []
+        for cv in colocated:
+            cv_id = cv.get("id", "")
+            if not cv_id.startswith("rs"):
+                continue
+            # 检查 alt 等位基因是否在 clin_sig_allele 中
+            clin_sig_allele = cv.get("clin_sig_allele", [])
+            cv_clin_sig     = cv.get("clin_sig", [])
+            if cv_clin_sig:
+                # 过滤出与 alt 等位基因匹配的分类
+                alt_sigs = []
+                for entry in (clin_sig_allele if isinstance(clin_sig_allele, list)
+                              else [clin_sig_allele]):
+                    # 格式: "T:pathogenic" 或 "A:pathogenic/likely_pathogenic"
+                    if isinstance(entry, str) and ":" in entry:
+                        allele_part, sig_part = entry.split(":", 1)
+                        if allele_part.upper() == alt.upper():
+                            alt_sigs.extend(sig_part.split("/"))
+                if not alt_sigs:
+                    alt_sigs = cv_clin_sig  # fallback: use all sigs
+                rsid     = cv_id
+                clin_sig = list(dict.fromkeys(alt_sigs))  # deduplicate, preserve order
+                break
+
+        if not rsid:
+            return {"clinvar_id": None, "clinical_significance": "Not in ClinVar",
+                    "review_status": "", "conditions": [], "last_evaluated": "", "rsid": ""}
+
+        # 规范化 significance（首字母大写，下划线→空格）
+        def _normalize(s: str) -> str:
+            return s.replace("_", " ").replace("/", " / ").title()
+
+        sig_display = " / ".join(_normalize(s) for s in clin_sig) if clin_sig else "Unknown"
+
+        # ── Step 2: NCBI esummary via rsID for review_status + conditions ───
+        review_status = ""
+        conditions    = []
+        last_eval     = ""
+        clinvar_id    = ""
+
+        try:
+            search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+            sr = requests.get(search_url,
+                              params={"db": "clinvar", "term": f"{rsid}[rs]",
+                                      "retmode": "json", "retmax": 3},
+                              timeout=10)
+            ids = sr.json().get("esearchresult", {}).get("idlist", [])
+            if ids:
+                sum_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+                sr2 = requests.get(sum_url,
+                                   params={"db": "clinvar", "id": ",".join(ids[:3]),
+                                           "retmode": "json"},
+                                   timeout=10)
+                result = sr2.json().get("result", {})
+                for uid in result.get("uids", []):
+                    entry = result[uid]
+                    gc    = entry.get("germline_classification", {})
+                    if gc.get("description"):
+                        review_status = gc.get("review_status", "")
+                        last_eval     = gc.get("last_evaluated", "")
+                        clinvar_id    = entry.get("accession", "")
+                        for t in gc.get("trait_set", []):
+                            name = t.get("trait_name", "")
+                            if name:
+                                conditions.append(name)
+                        break
+        except Exception:
+            pass  # Step 2 失败时仍返回 Step 1 数据
+
+        return {
+            "clinvar_id":            clinvar_id or rsid,
+            "clinical_significance": sig_display,
+            "review_status":         review_status,
+            "conditions":            conditions,
+            "last_evaluated":        last_eval,
+            "rsid":                  rsid,
         }
-        r2 = requests.get(fetch_url, params=fetch_params, timeout=15)
-        if r2.status_code != 200:
-            return {"error": f"ClinVar fetch failed: HTTP {r2.status_code}"}
-        data          = r2.json()
-        result_set    = data.get("ClinVarResult-Set", {})
-        variants_list = result_set.get("VariationArchive", [])
-        if isinstance(variants_list, dict):
-            variants_list = [variants_list]
-        for var in variants_list:
-            interp   = var.get("InterpretedRecord", {})
-            allele   = interp.get("SimpleAllele", {})
-            loc_list = allele.get("Location", {}).get("SequenceLocation", [])
-            if isinstance(loc_list, dict):
-                loc_list = [loc_list]
-            for loc in loc_list:
-                if (loc.get("Assembly") == "GRCh38"
-                        and str(loc.get("positionVCF")) == str(pos)
-                        and loc.get("referenceAlleleVCF", "").upper() == ref.upper()
-                        and loc.get("alternateAlleleVCF", "").upper() == alt.upper()):
-                    interps = interp.get("Interpretations", {}).get("Interpretation", [])
-                    if isinstance(interps, dict):
-                        interps = [interps]
-                    sig    = interps[0].get("Description", "") if interps else ""
-                    status = interps[0].get("ReviewStatus", "") if interps else ""
-                    date   = interps[0].get("DateLastEvaluated", "") if interps else ""
-                    conds  = []
-                    for cond in interp.get("ConditionList", {}).get("TraitSet", []):
-                        if isinstance(cond, dict):
-                            for trait in cond.get("Trait", []):
-                                if isinstance(trait, dict):
-                                    for name in trait.get("Name", []):
-                                        if (isinstance(name, dict)
-                                                and name.get("ElementValue", {}).get("Type") == "Preferred"):
-                                            conds.append(name["ElementValue"].get("$", ""))
-                    return {
-                        "clinvar_id":            var.get("Accession", ""),
-                        "clinical_significance": sig,
-                        "review_status":         status,
-                        "conditions":            conds,
-                        "last_evaluated":        date,
-                    }
-        return {"clinvar_id": None, "clinical_significance": "Not found at this position",
-                "review_status": "", "conditions": [], "last_evaluated": ""}
+
     except Exception as e:
         return {"error": f"ClinVar query error: {e}"}
 
@@ -557,10 +606,13 @@ def resolve_protein_variant(gene: str, protein_change: str,
             return {"error": f"No transcript found for {gene}"}
     except Exception as e:
         return {"error": f"Gene lookup error: {e}"}
-    hgvs_notation = f"{transcript_id}:{pc}"
+    # Strip version suffix from transcript ID (e.g. ENST00000269305.9 → ENST00000269305)
+    transcript_id_base = transcript_id.split(".")[0]
+    hgvs_notation = f"{transcript_id_base}:{pc}"
     hgvs_url      = f"{ENSEMBL_BASE}/variant_recoder/homo_sapiens/{hgvs_notation}"
     try:
-        r = requests.get(hgvs_url, headers=hdrs, timeout=15)
+        # vcf_string=1 is required to get VCF-format coordinates in the response
+        r = requests.get(hgvs_url, headers=hdrs, params={"vcf_string": 1}, timeout=20)
         if r.status_code != 200:
             return {"error": f"HGVS resolve failed: {hgvs_notation} HTTP {r.status_code}"}
         recoder_data = r.json()
