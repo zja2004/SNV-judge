@@ -77,7 +77,7 @@ ENSEMBL_BASE = "https://rest.ensembl.org"
 GENOS_DEFAULT_URL = "https://neuronic-marilynn-touristically.ngrok-free.dev"
 GENOS_FLANK       = 500   # 变异位点两侧各取 500 bp（共 1001 bp）
 GENOS_MODEL_NAME  = "10B" # 使用 Genos-10B 模型
-GENOS_TIMEOUT     = 60    # 单次 /extract 请求超时（秒）
+GENOS_TIMEOUT     = 120   # 单次 /generate 请求超时（秒，生成比 extract 慢）
 
 # ── ACMG 5 级分类阈值 ─────────────────────────────────────────────────────
 ACMG_TIERS = [
@@ -340,14 +340,15 @@ def fetch_genos_embedding_score(
     flank: int = GENOS_FLANK,
 ) -> float:
     """
-    通过本地 Genos-10B /extract 端点计算变异的 embedding 余弦距离评分。
+    通过本地 Genos-10B /generate 端点计算变异的生成差异评分。
 
-    原理（方案A）：
+    原理（方案B — /generate 接口适配）：
       1. 从 Ensembl 获取变异位点两侧各 flank bp 的基因组上下文（共 2*flank+1 bp）
       2. 构造 REF 序列（上下文原始序列）和 ALT 序列（中心碱基替换为 alt）
-      3. 分别调用 Genos /extract 获取 mean-pooled embedding 向量
-      4. 计算余弦距离：score = 1 - cosine_similarity(emb_ref, emb_alt)
-         - score ∈ [0, 1]，值越大表示变异对序列语义影响越大（→ 致病倾向）
+      3. 分别调用 Genos /generate，以 REF/ALT 序列为 prompt，各生成 100 bp 续写
+      4. 计算两个续写序列之间的 k-mer Jaccard 距离（k=6）：
+           score = 1 - |kmers_ref ∩ kmers_alt| / |kmers_ref ∪ kmers_alt|
+         - score ∈ [0, 1]，值越大表示变异对模型生成的影响越大（→ 致病倾向）
          - 与训练集 genos_score 中位数（0.676）同量纲，可直接替换
 
     Args:
@@ -359,13 +360,13 @@ def fetch_genos_embedding_score(
         flank:     两侧各取 flank bp（默认 500）
 
     Returns:
-        float: 余弦距离评分 ∈ [0, 1]；失败时返回 np.nan（调用方自动降级到中位数）
+        float: k-mer Jaccard 距离评分 ∈ [0, 1]；失败时返回 np.nan（调用方自动降级到中位数）
     """
     # Step 1: 获取基因组上下文（复用带缓存的 fetch_genomic_context）
     context = fetch_genomic_context(chrom, pos, flank=flank)
     expected_len = 2 * flank + 1
     if not context or len(context) < expected_len:
-        print(f"  ⚠️  Genos: 基因组上下文获取失败（长度 {len(context)}，期望 {expected_len}）")
+        print(f"  ⚠️  Genos: 基因组上下文获取失败（长度 {len(context) if context else 0}，期望 {expected_len}）")
         return np.nan
 
     # Step 2: 构造 REF / ALT 序列
@@ -379,48 +380,55 @@ def fetch_genos_embedding_score(
         print(f"  ⚠️  Genos: 中心碱基不匹配（期望 {ref.upper()}，实际 {actual_center}）"
               f"，仍继续计算（可能坐标系偏移）")
 
-    # Step 3: 调用 /extract 获取 embedding
-    extract_url = f"{genos_url.rstrip('/')}/extract"
+    # Step 3: 调用 /generate 获取续写序列
+    generate_url = f"{genos_url.rstrip('/')}/generate"
 
-    def _get_emb(sequence: str):
+    def _get_generation(sequence: str) -> str | None:
         try:
             r = requests.post(
-                extract_url,
-                json={
-                    "sequence":       sequence.upper(),
-                    "model_name":     GENOS_MODEL_NAME,
-                    "pooling_method": "mean",
-                },
-                timeout=GENOS_TIMEOUT,
+                generate_url,
+                json={"sequence": sequence.upper()},
+                timeout=GENOS_TIMEOUT * 3,  # 生成比 extract 慢，超时设为 3x
             )
             if r.status_code == 200:
-                emb = r.json().get("result", {}).get("embedding")
-                if emb:
-                    return np.array(emb, dtype=np.float32)
-            print(f"  ⚠️  Genos /extract HTTP {r.status_code}: {r.text[:80]}")
+                data = r.json()
+                raw_output = data.get("output", "")
+                # 去除空格（模型输出格式为 "A T C G ..."）
+                gen_seq = raw_output.replace(" ", "").upper()
+                if gen_seq:
+                    return gen_seq
+            print(f"  ⚠️  Genos /generate HTTP {r.status_code}: {r.text[:80]}")
         except Exception as e:
-            print(f"  ⚠️  Genos /extract 请求失败: {e}")
+            print(f"  ⚠️  Genos /generate 请求失败: {e}")
         return None
 
-    emb_ref = _get_emb(ref_seq)
-    emb_alt = _get_emb(alt_seq)
+    print(f"  → Genos /generate: 正在生成 REF 续写（{len(ref_seq)} bp prompt）...")
+    gen_ref = _get_generation(ref_seq)
+    print(f"  → Genos /generate: 正在生成 ALT 续写（{len(alt_seq)} bp prompt）...")
+    gen_alt = _get_generation(alt_seq)
 
-    if emb_ref is None or emb_alt is None:
+    if gen_ref is None or gen_alt is None:
         return np.nan
 
-    # Step 4: 余弦距离 = 1 - cosine_similarity
-    dot      = float(np.dot(emb_ref, emb_alt))
-    norm_ref = float(np.linalg.norm(emb_ref))
-    norm_alt = float(np.linalg.norm(emb_alt))
-    if norm_ref < 1e-9 or norm_alt < 1e-9:
+    # Step 4: k-mer Jaccard 距离（k=6）
+    k = 6
+    def _kmer_set(seq: str, k: int) -> set:
+        return {seq[i:i+k] for i in range(len(seq) - k + 1)}
+
+    kmers_ref = _kmer_set(gen_ref, k)
+    kmers_alt = _kmer_set(gen_alt, k)
+
+    intersection = len(kmers_ref & kmers_alt)
+    union        = len(kmers_ref | kmers_alt)
+    if union == 0:
         return np.nan
 
-    cosine_sim  = dot / (norm_ref * norm_alt)
-    cosine_dist = 1.0 - float(np.clip(cosine_sim, -1.0, 1.0))
-    genos_score = float(np.clip(cosine_dist, 0.0, 1.0))
+    jaccard_sim  = intersection / union
+    jaccard_dist = 1.0 - jaccard_sim
+    genos_score  = float(np.clip(jaccard_dist, 0.0, 1.0))
 
-    print(f"  ✓ Genos embedding 评分: {genos_score:.4f}  "
-          f"（cosine_dist REF↔ALT，flank={flank}bp）")
+    print(f"  ✓ Genos 生成差异评分: {genos_score:.4f}  "
+          f"（k-mer Jaccard 距离 k={k}，REF↔ALT 续写，flank={flank}bp）")
     return genos_score
 
 
