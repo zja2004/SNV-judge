@@ -252,10 +252,10 @@ streamlit run app.py
 
 ```bash
 # 单变异预测
-python skill/scripts/predict.py 17 7674220 C T /path/to/SNV-judge
+python skill/scripts/predict.py 17 7675088 C T /path/to/SNV-judge
 
 # 启用本地 Genos embedding（无需 API Key）
-python skill/scripts/predict.py 17 7674220 C T /path/to/SNV-judge \
+python skill/scripts/predict.py 17 7675088 C T /path/to/SNV-judge \
     --genos-url https://xxx.ngrok-free.dev
 
 # 批量 VCF 预测
@@ -269,7 +269,7 @@ python skill/scripts/predict.py --vcf variants.vcf /path/to/SNV-judge \
 from skill.scripts.predict import load_model_artifacts, predict_variant, print_shap_summary
 
 artifacts = load_model_artifacts("/path/to/SNV-judge")
-result = predict_variant("17", 7674220, "C", "T", artifacts=artifacts)
+result = predict_variant("17", 7675088, "C", "T", artifacts=artifacts)
 
 print(f"致病概率: {result['prob_pathogenic']:.1%}")
 print(f"ACMG 分级: {result['acmg_tier']}")
@@ -280,9 +280,9 @@ print_shap_summary(result)
 
 | 变异 | 基因 | 预期结果 |
 |------|------|---------|
-| chr17:7674220 C>T | TP53 R175H | 致病 |
-| chr17:43057062 C>T | BRCA1 R1699W | 致病 |
-| chr13:32906729 C>A | BRCA2 N372H | 良性 |
+| chr17:7675088 C>T | TP53 R175H | 致病 |
+| chr17:43063931 G>A | BRCA1 R1699W | 致病 |
+| chr13:32332592 A>C | BRCA2 N372H | 良性 |
 
 ---
 

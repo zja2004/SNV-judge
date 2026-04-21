@@ -252,10 +252,10 @@ streamlit run app.py
 
 ```bash
 # Single variant
-python skill/scripts/predict.py 17 7674220 C T /path/to/SNV-judge
+python skill/scripts/predict.py 17 7675088 C T /path/to/SNV-judge
 
 # With local Genos embedding (no API key needed)
-python skill/scripts/predict.py 17 7674220 C T /path/to/SNV-judge \
+python skill/scripts/predict.py 17 7675088 C T /path/to/SNV-judge \
     --genos-url https://xxx.ngrok-free.dev
 
 # Batch VCF
@@ -269,7 +269,7 @@ python skill/scripts/predict.py --vcf variants.vcf /path/to/SNV-judge \
 from skill.scripts.predict import load_model_artifacts, predict_variant, print_shap_summary
 
 artifacts = load_model_artifacts("/path/to/SNV-judge")
-result = predict_variant("17", 7674220, "C", "T", artifacts=artifacts)
+result = predict_variant("17", 7675088, "C", "T", artifacts=artifacts)
 
 print(f"Pathogenicity: {result['prob_pathogenic']:.1%}")
 print(f"ACMG tier:     {result['acmg_tier']}")
@@ -280,9 +280,9 @@ print_shap_summary(result)
 
 | Variant | Gene | Expected |
 |---------|------|----------|
-| chr17:7674220 C>T | TP53 R175H | Pathogenic |
-| chr17:43057062 C>T | BRCA1 R1699W | Pathogenic |
-| chr13:32906729 C>A | BRCA2 N372H | Benign |
+| chr17:7675088 C>T | TP53 R175H | Pathogenic |
+| chr17:43063931 G>A | BRCA1 R1699W | Pathogenic |
+| chr13:32332592 A>C | BRCA2 N372H | Benign |
 
 ---
 

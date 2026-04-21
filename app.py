@@ -838,15 +838,15 @@ with tab_single:
         st.markdown("Enter a **GRCh38** missense SNV:")
         chrom = st.text_input("Chromosome", value="17",
                               help="e.g. 17, X (no 'chr' prefix)")
-        pos   = st.number_input("Position (1-based)", value=7674220, min_value=1)
+        pos   = st.number_input("Position (1-based)", value=7675088, min_value=1)
         ref   = st.text_input("Reference allele", value="C").upper().strip()
         alt   = st.text_input("Alternate allele",  value="T").upper().strip()
         st.markdown("---")
         st.markdown("**Example variants**")
         examples = {
-            "TP53 R175H (pathogenic)":   ("17", 7674220,  "C", "T"),
-            "BRCA1 R1699W (pathogenic)": ("17", 43057062, "C", "T"),
-            "BRCA2 N372H (benign)":      ("13", 32906729, "C", "A"),
+            "TP53 R175H (pathogenic)":   ("17", 7675088,  "C", "T"),
+            "BRCA1 R1699W (pathogenic)": ("17", 43063931, "G", "A"),
+            "BRCA2 N372H (benign)":      ("13", 32332592, "A", "C"),
         }
         for name, (ec, ep, er, ea) in examples.items():
             if st.button(name, use_container_width=True):
@@ -1190,8 +1190,8 @@ with tab_batch:
 ```
 ##fileformat=VCFv4.2
 #CHROM  POS     ID  REF  ALT  ...
-17      7674220 .   C    T    ...
-13      32906729 .  C    A    ...
+17      7675088 .   C    T    ...
+13      32332592 .  A    C    ...
 ```
         """)
 
@@ -1518,22 +1518,22 @@ with tab_report:
         st.markdown("*或在「🔬 Single Variant」标签页预测后点击「生成 AI 报告」按钮*")
 
         r_chrom = st.text_input("染色体", value="17", key="r_chrom")
-        r_pos   = st.number_input("位置 (GRCh38)", value=7674220, min_value=1, key="r_pos")
+        r_pos   = st.number_input("位置 (GRCh38)", value=7675088, min_value=1, key="r_pos")
         r_ref   = st.text_input("REF", value="C", key="r_ref").upper().strip()
         r_alt   = st.text_input("ALT", value="T", key="r_alt").upper().strip()
 
         st.markdown("**快速示例**")
         ex_cols = st.columns(3)
         if ex_cols[0].button("TP53 R175H", key="ex_tp53"):
-            st.session_state.update({"r_chrom": "17", "r_pos": 7674220,
+            st.session_state.update({"r_chrom": "17", "r_pos": 7675088,
                                      "r_ref": "C", "r_alt": "T"})
             st.rerun()
         if ex_cols[1].button("BRCA1 R1699W", key="ex_brca1"):
-            st.session_state.update({"r_chrom": "17", "r_pos": 43057062,
+            st.session_state.update({"r_chrom": "17", "r_pos": 43063931,
                                      "r_ref": "C", "r_alt": "T"})
             st.rerun()
         if ex_cols[2].button("BRCA2 N372H", key="ex_brca2"):
-            st.session_state.update({"r_chrom": "13", "r_pos": 32906729,
+            st.session_state.update({"r_chrom": "13", "r_pos": 32332592,
                                      "r_ref": "C", "r_alt": "A"})
             st.rerun()
 

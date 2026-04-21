@@ -30,11 +30,11 @@ Usage:
     from scripts.predict import predict_variant, load_model_artifacts
 
     artifacts = load_model_artifacts(model_dir="/path/to/SNV-judge")
-    result = predict_variant("17", 7674220, "C", "T", artifacts=artifacts)
+    result = predict_variant("17", 7675088, "C", "T", artifacts=artifacts)
     print(result["cal_prob"], result["acmg_class"])
 
     # 启用 Genos embedding 评分
-    result = predict_variant("17", 7674220, "C", "T", artifacts=artifacts,
+    result = predict_variant("17", 7675088, "C", "T", artifacts=artifacts,
                               genos_url="https://xxx.ngrok-free.dev")
 
     results_df = predict_vcf("variants.vcf", artifacts=artifacts, output_csv="results.csv")
@@ -44,10 +44,10 @@ Usage:
                               artifacts=artifacts)
 
 CLI:
-    python predict.py 17 7674220 C T /path/to/SNV-judge
+    python predict.py 17 7675088 C T /path/to/SNV-judge
     python predict.py --vcf variants.vcf /path/to/SNV-judge --output results.csv
     python predict.py --gene TP53 --protein R175H /path/to/SNV-judge --clinvar
-    python predict.py 17 7674220 C T /path/to/SNV-judge \
+    python predict.py 17 7675088 C T /path/to/SNV-judge \
         --genos-url https://neuronic-marilynn-touristically.ngrok-free.dev
 """
 
@@ -1034,7 +1034,7 @@ def print_shap_summary(result: dict):
     打印单变异 SHAP 贡献简洁摘要（无需 matplotlib）。
 
     与 SKILL.md 快速开始示例一致：
-        result = predict_variant("17", 7674220, "C", "T", artifacts=artifacts)
+        result = predict_variant("17", 7675088, "C", "T", artifacts=artifacts)
         print_shap_summary(result)
 
     输出示例：
@@ -1112,7 +1112,7 @@ def generate_clinical_report(
         DeepSeek:        base_url="https://api.deepseek.com/v1"
 
     Example:
-        result = predict_variant("17", 7674220, "C", "T", artifacts=artifacts)
+        result = predict_variant("17", 7675088, "C", "T", artifacts=artifacts)
         report = generate_clinical_report(result, api_key="sk-xxx", template="chinese")
         print(report)
     """
@@ -1179,10 +1179,10 @@ def main():
         epilog="""
 Examples:
   # Single variant (positional args)
-  python predict.py 17 7674220 C T /path/to/SNV-judge
+  python predict.py 17 7675088 C T /path/to/SNV-judge
 
   # Single variant with Genos embedding scoring
-  python predict.py 17 7674220 C T /path/to/SNV-judge \
+  python predict.py 17 7675088 C T /path/to/SNV-judge \
       --genos-url https://xxx.ngrok-free.dev
 
   # Protein variant shorthand

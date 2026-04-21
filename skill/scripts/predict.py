@@ -30,11 +30,11 @@ Usage:
     from scripts.predict import predict_variant, load_model_artifacts
 
     artifacts = load_model_artifacts(model_dir="/path/to/SNV-judge")
-    result = predict_variant("17", 7674220, "C", "T", artifacts=artifacts)
+    result = predict_variant("17", 7675088, "C", "T", artifacts=artifacts)
     print(result["cal_prob"], result["acmg_class"])
 
     # 启用 Genos embedding 评分
-    result = predict_variant("17", 7674220, "C", "T", artifacts=artifacts,
+    result = predict_variant("17", 7675088, "C", "T", artifacts=artifacts,
                               genos_url="https://xxx.ngrok-free.dev")
 
     results_df = predict_vcf("variants.vcf", artifacts=artifacts, output_csv="results.csv")
@@ -44,10 +44,10 @@ Usage:
                               artifacts=artifacts)
 
 CLI:
-    python predict.py 17 7674220 C T /path/to/SNV-judge
+    python predict.py 17 7675088 C T /path/to/SNV-judge
     python predict.py --vcf variants.vcf /path/to/SNV-judge --output results.csv
     python predict.py --gene TP53 --protein R175H /path/to/SNV-judge --clinvar
-    python predict.py 17 7674220 C T /path/to/SNV-judge \
+    python predict.py 17 7675088 C T /path/to/SNV-judge \
         --genos-url https://neuronic-marilynn-touristically.ngrok-free.dev
 """
 
@@ -210,6 +210,23 @@ def fetch_vep_scores(chrom: str, pos: int, ref: str, alt: str) -> dict:
 
     csq = chosen.get("consequence_terms", [])
     am  = chosen.get("alphamissense", {})
+
+    # ── PolyPhen 回退逻辑 ────────────────────────────────────────────────
+    # VEP 的 MANE select / canonical 转录本有时不计算 PolyPhen（已知行为，
+    # 例如 TP53 ENST00000269305）。当主转录本 polyphen_score 为 None 时，
+    # 回退到同基因中有 polyphen_score 的第一个 missense 转录本。
+    polyphen_score = chosen.get("polyphen_score")
+    polyphen_pred  = chosen.get("polyphen_prediction")
+    if polyphen_score is None:
+        chosen_gene = chosen.get("gene_symbol", "")
+        for tc in tcs:
+            if (tc.get("gene_symbol") == chosen_gene
+                    and tc.get("polyphen_score") is not None
+                    and "missense_variant" in tc.get("consequence_terms", [])):
+                polyphen_score = tc["polyphen_score"]
+                polyphen_pred  = tc.get("polyphen_prediction")
+                break
+
     result = {
         "gene":             chosen.get("gene_symbol", ""),
         "transcript":       chosen.get("transcript_id", ""),
@@ -217,8 +234,8 @@ def fetch_vep_scores(chrom: str, pos: int, ref: str, alt: str) -> dict:
         "consequence":      ", ".join(csq),
         "sift_score":       chosen.get("sift_score"),
         "sift_pred":        chosen.get("sift_prediction"),
-        "polyphen_score":   chosen.get("polyphen_score"),
-        "polyphen_pred":    chosen.get("polyphen_prediction"),
+        "polyphen_score":   polyphen_score,
+        "polyphen_pred":    polyphen_pred,
         "cadd_phred":       chosen.get("cadd_phred"),
         "am_pathogenicity": am.get("am_pathogenicity") if isinstance(am, dict) else None,
         "am_class":         am.get("am_class")         if isinstance(am, dict) else None,
@@ -1133,7 +1150,7 @@ def print_shap_summary(result: dict):
     打印单变异 SHAP 贡献简洁摘要（无需 matplotlib）。
 
     与 SKILL.md 快速开始示例一致：
-        result = predict_variant("17", 7674220, "C", "T", artifacts=artifacts)
+        result = predict_variant("17", 7675088, "C", "T", artifacts=artifacts)
         print_shap_summary(result)
 
     输出示例：
@@ -1211,7 +1228,7 @@ def generate_clinical_report(
         DeepSeek:        base_url="https://api.deepseek.com/v1"
 
     Example:
-        result = predict_variant("17", 7674220, "C", "T", artifacts=artifacts)
+        result = predict_variant("17", 7675088, "C", "T", artifacts=artifacts)
         report = generate_clinical_report(result, api_key="sk-xxx", template="chinese")
         print(report)
     """
@@ -1281,10 +1298,10 @@ def main():
         epilog="""
 Examples:
   # Single variant (positional args)
-  python predict.py 17 7674220 C T /path/to/SNV-judge
+  python predict.py 17 7675088 C T /path/to/SNV-judge
 
   # Single variant with Genos embedding scoring
-  python predict.py 17 7674220 C T /path/to/SNV-judge \
+  python predict.py 17 7675088 C T /path/to/SNV-judge \
       --genos-url https://xxx.ngrok-free.dev
 
   # Protein variant shorthand

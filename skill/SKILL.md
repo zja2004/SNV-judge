@@ -78,7 +78,7 @@ artifacts = load_model_artifacts(".")
 ```python
 result = predict_variant(
     chrom="17",        # chromosome, no "chr" prefix, GRCh38
-    pos=7674220,       # 1-based position
+    pos=7675088,       # 1-based position
     ref="C",           # reference allele
     alt="T",           # alternate allele
     artifacts=artifacts,
@@ -111,7 +111,7 @@ print_result(result)
 ```python
 # User says "TP53 R175H" — resolve to genomic coordinates first
 coords = resolve_protein_variant("TP53", "R175H")
-# coords = {"chrom": "17", "pos": 7674220, "ref": "C", "alt": "T", ...}
+# coords = {"chrom": "17", "pos": 7675088, "ref": "C", "alt": "T", ...}
 
 result = predict_variant(
     coords["chrom"], coords["pos"], coords["ref"], coords["alt"],
@@ -181,7 +181,7 @@ for chunk in generate_clinical_report(result, api_key="sk-xxx", stream=True):
 ### 5. Fetch ClinVar ground truth
 
 ```python
-cv = fetch_clinvar_classification("17", 7674220, "C", "T")
+cv = fetch_clinvar_classification("17", 7675088, "C", "T")
 print(cv["clinical_significance"])  # e.g. "Pathogenic"
 print(cv["review_status"])          # e.g. "reviewed by expert panel"
 print(cv["conditions"])             # list of associated diseases
@@ -285,7 +285,7 @@ Expected report structure (chinese template):
 ```markdown
 ## 变异解读报告
 ### 一、变异基本信息
-chr17:7674220 C>T | 基因: TP53 | p.Arg175His
+chr17:7675088 C>T | 基因: TP53 | p.Arg175His
 ### 二、集成预测结果
 致病概率: 100.0% | ACMG分级: Pathogenic
 ### 三、多维度证据分析
